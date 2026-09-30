@@ -1,0 +1,16 @@
+{"id": "p01-math", "prompt": "一个袋子里有5个红球和3个蓝球。不放回地取出两个球，两个都是红球的概率是多少？请一步步推理。"}
+{"id": "p02-code", "prompt": "Write a Python function that finds the longest palindromic substring of a given string, with O(n^2) time complexity and clear comments."}
+{"id": "p03-logic", "prompt": "甲、乙、丙三人中只有一人说真话。甲说：乙在撒谎。乙说：丙在撒谎。丙说：甲和乙都在撒谎。请分析谁说的是真话。"}
+{"id": "p04-explain", "prompt": "请向一个只学过高中物理的学生解释：为什么GPS卫星上的时钟比地面上的时钟走得更快？请用通俗语言但保持准确。"}
+{"id": "p05-story", "prompt": "写一个200字左右的微型小说，主题是：深夜便利店里，一位程序员遇到了一个奇怪的老顾客。"}
+{"id": "p06-translate", "prompt": "将下面句子翻译成英文并解释你处理的难点：\"这篇文章的逻辑漏洞百出，但作者的文笔确实犀利，让人读起来欲罢不能。\""}
+{"id": "p07-sci", "prompt": "Explain the key differences between CRISPR-Cas9 and base editing technologies, and when a researcher would choose one over the other."}
+{"id": "p08-algo", "prompt": "一个无向图有n个节点和m条边，用什么算法判断它是否是二分图？说明复杂度并给出思路。"}
+{"id": "p09-rewrite", "prompt": "把这段话改写成正式的商务邮件语气：\"喂，那个报告我明天才能给你，今天实在来不及了，别催了。\""}
+{"id": "p10-econ", "prompt": "为什么央行加息通常会导致股市下跌？请从贴现率、企业融资成本和投资者风险偏好三个角度分析。"}
+{"id": "p11-debug", "prompt": "下面这段Python代码在处理空列表时会崩溃，请找出原因并修复：\n\ndef average(nums):\n    return sum(nums) / len(nums)\n\nprint(average([]))"}
+{"id": "p12-hist", "prompt": "简述丝绸之路从长安到罗马的主要路线，以及它在唐朝和罗马帝国时期分别贸易什么商品。"}
+{"id": "p13-med", "prompt": "Explain why antibiotic resistance develops so quickly in bacteria, using the concepts of selection pressure and horizontal gene transfer."}
+{"id": "p14-phil", "prompt": "简述忒修斯之船悖论，并给出一个现代信息论视角的解答尝试。"}
+{"id": "p15-sql", "prompt": "Write a SQL query that finds, for each department, the employee with the third-highest salary. Assume a standard employees(dept, name, salary) table."}
+{"id": "p16-nl", "prompt": "总结一下注意力机制中Q、K、V三个矩阵各自的含义，以及为什么点积后要除以根号下维度数。"}
