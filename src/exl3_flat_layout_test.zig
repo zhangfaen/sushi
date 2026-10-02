@@ -311,3 +311,274 @@ test "flat EXL3 routed-key filtering is independent of shard filename" {
         model.qwen4StreamingWeightKey(.exl3_k4, &key_buf, "language_model.mtp.fc_hidden.weight").?,
     );
 }
+
+test "EXL3 streaming CPU config engages only with a budget and refuses MTP" {
+    const stream = @import("expert_stream.zig");
+    const cfg = model.ModelConfig{
+        .model_type = "qwen4_exp",
+        .num_hidden_layers = 48,
+        .num_experts = 512,
+        .num_experts_per_tok = 10,
+        .hidden_size = 2560,
+        .moe_intermediate_size = 640,
+        .expert_layout = .exl3_k4,
+        .quant_bits = 8,
+    };
+    try std.testing.expect(cfg.streamsExperts());
+    try std.testing.expect(!cfg.expertStreamingRequired());
+    try std.testing.expect(!stream.expertStreamingEngaged(cfg.streamsExperts(), cfg.expertStreamingRequired(), 0, 0));
+    try std.testing.expect(stream.expertStreamingEngaged(cfg.streamsExperts(), cfg.expertStreamingRequired(), 0, 20 << 30));
+    try std.testing.expect(stream.expertStreamingEngaged(cfg.streamsExperts(), cfg.expertStreamingRequired(), 1 << 30, 0));
+    try std.testing.expect(stream.mtpRefusal(true, true) != null);
+    try std.testing.expectEqual(stream.MtpUnderStreaming.refuse, stream.mtpUnderStreaming(true, false, false));
+}
+
+test "EXL3 streaming CPU store spans all nine tensors with exact source bytes" {
+    const stream = @import("expert_stream.zig");
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const path = try createFixture(io, a, &tmp);
+    defer a.free(path);
+    var store = try stream.ExpertStore.openLayout(a, path, .{ .layers = 1, .experts = 2, .hidden = 16, .intermediate = 16 }, .exl3_k4);
+    defer store.deinit();
+    try std.testing.expectEqual(@as(usize, 9), store.componentCount());
+    try std.testing.expectEqual(@as(u64, 576), store.perExpertBytes());
+    var offset: usize = 0;
+    for (EXL3_SPECS, 0..) |spec, ci| {
+        const slab = store.slabSpec(ci);
+        try std.testing.expectEqual(@as(u8, 2), slab.elem_bytes);
+        try std.testing.expectEqual(spec.bytes / 2, slab.slot_bytes);
+        for (0..2) |expert| {
+            const span = store.spanAt(0, @intCast(expert), ci);
+            const bytes = try a.alloc(u8, @intCast(span.len));
+            defer a.free(bytes);
+            try stream.readExact(store.fdAt(span.file), bytes, span.offset);
+            for (bytes, 0..) |byte, j| try std.testing.expectEqual(@as(u8, @intCast((offset + expert * bytes.len + j + 17) % 251)), byte);
+        }
+        offset += spec.bytes;
+    }
+}
+
+test "EXL3 streaming CPU Sushi geometry ledger at 20 GiB bills every bank" {
+    const stream = @import("expert_stream.zig");
+    for ([_]u32{ 32, 42, 48, 64 }) |n| {
+        const per = try stream.exl3ExpertBytes(.{ .layers = 48, .experts = 512, .hidden = 2560, .intermediate = 640, .exl3_n = n });
+        try std.testing.expectEqual(@as(u64, 38400) * n + 19200, per);
+        const ledger = try stream.budgetLedger(20 << 30, 6 << 30, 0, 48, 512, 10, per, stream.BOUNCE_BYTES);
+        const fixed = (6 << 30) + 512 * per + 10 * per + stream.BOUNCE_BYTES;
+        try std.testing.expectEqual(@min(512, ((20 << 30) - fixed) / (48 * per)), ledger.slots_per_layer);
+        try std.testing.expect(fixed + ledger.cache_bytes <= 20 << 30);
+        try std.testing.expect(fixed + ledger.cache_bytes + 48 * per > 20 << 30);
+        var slab_pages: u64 = 0;
+        for ([_]u64{ 2560 * 640 / 256 * n * 2, 2560 * 2, 640 * 2 }) |component| {
+            slab_pages += 3 * (48 * std.mem.alignForward(u64, component * ledger.slots_per_layer, 16384) + std.mem.alignForward(u64, component * 512, 16384));
+        }
+        const spans = @sizeOf(stream.SourceSpan) * 48 * 512 * 9;
+        const cache_metadata = 48 * (512 * @sizeOf(i32) + @as(u64, ledger.slots_per_layer) * (@sizeOf(u16) + @sizeOf(u64) + @sizeOf(bool)));
+        const actual_bounce = stream.FILL_WORKERS * 64 * 1024 * 1024;
+        try std.testing.expect((6 << 30) + slab_pages + spans + cache_metadata + actual_bounce + ledger.selected_bytes <= 20 << 30);
+    }
+}
+
+test "EXL3 streaming CPU refuses grouped banks and invalid trellis geometry" {
+    const stream = @import("expert_stream.zig");
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const path = path_buf[0..path_len];
+    const geometry: stream.Geometry = .{ .layers = 1, .experts = 2, .hidden = 16, .intermediate = 16, .exl3_n = 32 };
+    const grouped = "language_model.model.layers.0.mlp.switch_mlp.gate_proj.g0.trellis";
+    try writeIndex(std.testing.io, a, tmp.dir, &.{.{ .key = grouped, .file = "experts.safetensors" }});
+    try std.testing.expectError(error.Exl3RateGroupsStreamingUnsupported, expert_quant.streamingLayoutOfDir(a, std.testing.io, "qwen4_exp", path, 1, 0));
+    try std.testing.expectError(error.Exl3RateGroupsStreamingUnsupported, stream.ExpertStore.openLayout(a, path, geometry, .exl3_k4));
+    var entries: [9]IndexSpec = undefined;
+    for (EXL3_SPECS, 0..) |spec, ci| entries[ci] = .{ .key = spec.key, .file = "experts.safetensors" };
+    try writeIndex(std.testing.io, a, tmp.dir, &entries);
+    try writeSafetensors(std.testing.io, a, tmp.dir, "experts.safetensors", &EXL3_SPECS);
+    try std.testing.expectError(error.Exl3TrellisGeometry, stream.ExpertStore.openLayout(a, path, geometry, .exl3_k4));
+}
+
+fn gpuExl3Bank(arrays: [9]@import("mlx.zig").mlx_array) @import("sushi_exl3").Bank {
+    return .{
+        .gate = .{ .trellis = arrays[0], .suh = arrays[1], .svh = arrays[2] },
+        .up = .{ .trellis = arrays[3], .suh = arrays[4], .svh = arrays[5] },
+        .down = .{ .trellis = arrays[6], .suh = arrays[7], .svh = arrays[8] },
+    };
+}
+
+test "EXL3 streaming GPU slab matches resident decode prefill hits misses and union" {
+    const mlx = @import("mlx.zig");
+    const exl3 = @import("sushi_exl3");
+    const stream = @import("expert_stream.zig");
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    const experts = 6;
+    const hidden = 128;
+    const intermediate = 256;
+    for ([_]u32{ 32, 40, 42, 48, 64 }) |n| {
+        for ([_]mlx.mlx_dtype{ .float16, .bfloat16 }) |dtype| {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            var keys: [9][192]u8 = undefined;
+            var shapes: [9][4]u64 = undefined;
+            var specs: [9]TensorSpec = undefined;
+            var entries: [9]IndexSpec = undefined;
+            var resident: [9]mlx.mlx_array = @splat(.{});
+            defer for (resident) |arr| {
+                if (arr.ctx != null) _ = mlx.mlx_array_free(arr);
+            };
+            for (0..9) |ci| {
+                const c: expert_quant.Component = @fromBackingInt(@intCast(ci));
+                const input: u32 = if (expert_quant.projectionOf(c) == .down) intermediate else hidden;
+                const output: u32 = if (expert_quant.projectionOf(c) == .down) hidden else intermediate;
+                const weight = expert_quant.partOf(c) == .weight;
+                const rank: usize = if (weight) 4 else 2;
+                shapes[ci] = if (weight) .{ experts, input / 16, output / 16, n } else .{ experts, if (expert_quant.partOf(c) == .scales) input else output, 0, 0 };
+                var elements: usize = 1;
+                for (shapes[ci][0..rank]) |d| elements *= @intCast(d);
+                const key = try expert_quant.exl3TensorKey(&keys[ci], 0, c);
+                specs[ci] = .{ .key = key, .dtype = if (weight) "U16" else "F16", .shape = shapes[ci][0..rank], .bytes = elements * 2 };
+                entries[ci] = .{ .key = key, .file = "experts.safetensors" };
+            }
+            try writeSafetensors(io, a, tmp.dir, "experts.safetensors", &specs);
+            try writeIndex(io, a, tmp.dir, &entries);
+            const file = try tmp.dir.readFileAlloc(io, "experts.safetensors", a, .limited(1 << 24));
+            defer a.free(file);
+            var at: usize = 8 + @as(usize, @intCast(std.mem.readInt(u64, file[0..8], .little)));
+            for (specs, 0..) |spec, ci| {
+                const words = try a.alloc(u16, spec.bytes / 2);
+                defer a.free(words);
+                for (words, 0..) |*word, j| {
+                    word.* = if (ci % 3 == 0) @truncate(j *% 3571 +% ci *% 997 +% n) else exl3.format.f32ToF16Bits(if ((j + ci) % 3 == 0) -0.25 else 0.375);
+                    std.mem.writeInt(u16, file[at + j * 2 ..][0..2], word.*, .little);
+                }
+                var shape: [4]c_int = undefined;
+                for (spec.shape, 0..) |d, j| shape[j] = @intCast(d);
+                resident[ci] = mlx.mlx_array_new_data(words.ptr, &shape, @intCast(spec.shape.len), if (ci % 3 == 0) .uint16 else .float16);
+                at += spec.bytes;
+            }
+            try tmp.dir.writeFile(io, .{ .sub_path = "experts.safetensors", .data = file });
+            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const len = try tmp.dir.realPath(io, &path_buf);
+            const geom: stream.Geometry = .{ .layers = 1, .experts = experts, .hidden = hidden, .intermediate = intermediate, .exl3_n = n };
+            const per = try stream.exl3ExpertBytes(geom);
+            var engine = try stream.Engine.initWithOptions(a, path_buf[0..len], geom, 3 * per, s, .{ .layout = .exl3_k4, .bounce_size = 1 << 20 });
+            defer engine.deinit();
+            try engine.warmCache();
+            try std.testing.expectEqual(@as(u64, 0), engine.fallback_imports);
+            for ([_]usize{ 1, 1, 2, 33, 65, 1 }) |rows| {
+                const topk: usize = if (rows == 1 and engine.layers[0].stats.groups > 4) 4 else 2;
+                const routes = try a.alloc(u16, rows * topk);
+                defer a.free(routes);
+                for (routes, 0..) |*id, j| id.* = if (rows <= 2 and topk == 2) ([_]u16{ 5, 1, 4, 1 })[j % 4] else @intCast((j * 5 + 2) % experts);
+                var seen: [experts]bool = @splat(false);
+                var expected_misses: u64 = 0;
+                for (routes) |id| {
+                    if (seen[id]) continue;
+                    seen[id] = true;
+                    const slot = engine.layers[0].cache.expert_to_slot[id];
+                    if (slot < 0 or !engine.slotReady(0, @intCast(slot))) expected_misses += 1;
+                }
+                const before = engine.fill_experts_total;
+                var prepared = try engine.prepareHost(0, routes);
+                defer prepared.deinit();
+                try std.testing.expectEqual(expected_misses, engine.fill_experts_total - before);
+                try std.testing.expectEqual(rows > 2 or topk > 3, prepared.workspace);
+                var slab: [9]mlx.mlx_array = undefined;
+                for (&slab, 0..) |*arr, ci| {
+                    arr.* = prepared.quantOperand(@fromBackingInt(@intCast(ci)));
+                    const actual = mlx.getShape(arr.*);
+                    try std.testing.expectEqual(specs[ci].shape.len, actual.len);
+                    try std.testing.expectEqual(if (ci % 3 == 0) mlx.mlx_dtype.uint16 else mlx.mlx_dtype.float16, mlx.mlx_array_dtype(arr.*));
+                }
+                const xh = try a.alloc(u16, rows * hidden);
+                defer a.free(xh);
+                for (xh, 0..) |*v, j| {
+                    const value = @as(f32, @floatFromInt(@as(i32, @intCast(j % 31)) - 15)) / 32;
+                    v.* = if (dtype == .float16) exl3.format.f32ToF16Bits(value) else @truncate(@as(u32, @bitCast(value)) >> 16);
+                }
+                const scores = try a.alloc(f32, routes.len);
+                defer a.free(scores);
+                for (scores, 0..) |*v, j| v.* = @as(f32, @floatFromInt(j % topk + 1)) / 16;
+                const route_shape = [_]c_int{ 1, @intCast(rows), @intCast(topk) };
+                const x = mlx.mlx_array_new_data(xh.ptr, &.{ 1, @intCast(rows), hidden }, 3, dtype);
+                defer _ = mlx.mlx_array_free(x);
+                const weights = mlx.mlx_array_new_data(scores.ptr, &route_shape, 3, .float32);
+                defer _ = mlx.mlx_array_free(weights);
+                const ids = mlx.mlx_array_new_data(routes.ptr, &route_shape, 3, .uint16);
+                defer _ = mlx.mlx_array_free(ids);
+                const local = mlx.mlx_array_new_data(prepared.remapped.ptr, &route_shape, 3, .uint16);
+                defer _ = mlx.mlx_array_free(local);
+                const dec: exl3.format.Decode = .{ .codebook = .mcg, .window = .w12 };
+                const reference = try exl3.moe(s, x, gpuExl3Bank(resident), ids, weights, dec, false);
+                defer _ = mlx.mlx_array_free(reference);
+                const actual = try exl3.moe(s, x, gpuExl3Bank(slab), local, weights, dec, false);
+                defer _ = mlx.mlx_array_free(actual);
+                try mlx.check(mlx.mlx_array_eval(reference));
+                try mlx.check(mlx.mlx_array_eval(actual));
+                try std.testing.expectEqual(dtype, mlx.mlx_array_dtype(actual));
+                const ref_words: [*]const u16 = if (dtype == .float16) @ptrCast(mlx.mlx_array_data_float16(reference) orelse return error.UnreadableExl3Output) else mlx.mlx_array_data_bfloat16(reference) orelse return error.UnreadableExl3Output;
+                const actual_words: [*]const u16 = if (dtype == .float16) @ptrCast(mlx.mlx_array_data_float16(actual) orelse return error.UnreadableExl3Output) else mlx.mlx_array_data_bfloat16(actual) orelse return error.UnreadableExl3Output;
+                for (ref_words[0 .. rows * hidden]) |word| try std.testing.expect(std.math.isFinite(if (dtype == .float16) exl3.format.f16BitsToF32(word) else @as(f32, @bitCast(@as(u32, word) << 16))));
+                try std.testing.expectEqualSlices(u16, ref_words[0 .. rows * hidden], actual_words[0 .. rows * hidden]);
+            }
+        }
+    }
+}
+
+test "EXL3 streaming CPU refusals survive the registry and HTTP boundary" {
+    const registry = @import("model_registry.zig").ModelRegistry;
+    const server = @import("server.zig");
+    inline for (.{ error.Exl3RateGroupsStreamingUnsupported, error.Exl3NonuniformStreamingUnsupported, error.Exl3GateUpRateMismatch }) |err| {
+        try std.testing.expectEqual(err, registry.loadErrorFromName(@errorName(err)));
+        const refusal = server.loadRefusalFor(err) orelse return error.MissingNamedRefusal;
+        try std.testing.expect(refusal.type.len > 0 and refusal.message.len > 0);
+    }
+}
+
+test "EXL3 streaming CPU rejects malformed banks and per-layer gate up rate mismatches" {
+    const stream = @import("expert_stream.zig");
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(io, &path_buf);
+    const path = path_buf[0..len];
+    const geometry: stream.Geometry = .{ .layers = 1, .experts = 2, .hidden = 16, .intermediate = 16 };
+    var entries: [18]IndexSpec = undefined;
+    var specs: [18]TensorSpec = undefined;
+    var keys: [9][192]u8 = undefined;
+    for (0..9) |ci| {
+        specs[ci] = EXL3_SPECS[ci];
+        specs[ci + 9] = EXL3_SPECS[ci];
+        specs[ci + 9].key = try expert_quant.exl3TensorKey(&keys[ci], 1, @fromBackingInt(@intCast(ci)));
+        entries[ci] = .{ .key = specs[ci].key, .file = "experts.safetensors" };
+        entries[ci + 9] = .{ .key = specs[ci + 9].key, .file = "experts.safetensors" };
+    }
+    try writeIndex(io, a, tmp.dir, entries[0..9]);
+    specs[1].dtype = "BF16";
+    try writeSafetensors(io, a, tmp.dir, "experts.safetensors", specs[0..9]);
+    try std.testing.expectError(error.Exl3TrellisGeometry, stream.ExpertStore.openLayout(a, path, geometry, .exl3_k4));
+    specs[1] = EXL3_SPECS[1];
+    const narrow = [_]u64{ 2, 1, 1, 32 };
+    specs[3].shape = &narrow;
+    specs[3].bytes = 128;
+    try writeSafetensors(io, a, tmp.dir, "experts.safetensors", specs[0..9]);
+    try std.testing.expectError(error.Exl3GateUpRateMismatch, stream.ExpertStore.openLayout(a, path, geometry, .exl3_k4));
+    specs[3] = EXL3_SPECS[3];
+    try writeSafetensors(io, a, tmp.dir, "experts.safetensors", specs[0..8]);
+    try std.testing.expectError(error.MissingExpertTensor, stream.ExpertStore.openLayout(a, path, geometry, .exl3_k4));
+    try writeIndex(io, a, tmp.dir, &entries);
+    var two = geometry;
+    two.layers = 2;
+    specs[9].shape = &narrow;
+    specs[9].bytes = 128;
+    try writeSafetensors(io, a, tmp.dir, "experts.safetensors", &specs);
+    try std.testing.expectError(error.Exl3GateUpRateMismatch, stream.ExpertStore.openLayout(a, path, two, .exl3_k4));
+}

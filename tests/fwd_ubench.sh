@@ -14,8 +14,11 @@ PORT="${PORT:-8099}"
 BIN="${BIN:-./zig-out/bin/sushi}"
 LOG="${LOG:-/tmp/fwd-ubench-$PORT.log}"
 
-pkill -f "sushi.*--port $PORT" 2>/dev/null
-sleep 1
+# Only the server this script starts is ever killed, by its PID.
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+  echo "port $PORT is already in use; stop that server or set PORT" >&2
+  exit 1
+fi
 
 SUSHI_DECODE_FWD_UBENCH="$ITERS" "$BIN" --model "$MODEL" --serve --port "$PORT" \
   --log-level info "$@" >"$LOG" 2>&1 &

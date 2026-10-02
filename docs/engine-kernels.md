@@ -21,7 +21,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   `SUSHI_DECODE_FWD_UBENCH_GDN_ARMS=1`.
 - Capturing GDN verify (B=1, S=2, separate projections) folds the norm-gate and rollback convolution history
   into the recurrence. A per-width pipeline probe uses independent inputs so a deferred PLE leaf stays lazy;
-  an unsupported threadgroup limit falls back to the existing recurrence and epilogue. Parity includes every
+  an unsupported threadgroup limit falls back to the existing recurrence and epilogue (an M1 declines S 3..8 and
+  folds S=2), so the parity test skips a declined width above two. Parity includes every
   captured state with bf16 carry rounding. Wider captures keep the existing path after the S=5 regression
   in [the width sweep](perf-baselines.md#gdn-verify-fold). Same-process A/B: `SUSHI_DECODE_FWD_UBENCH_GDN_FOLD_ARMS=1`.
 - A fused kernel that replaces a capture chain carries the chain's per-step STORE rounding:
@@ -35,7 +36,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   as a scalar input it cost 1-4% per verify forward ([perf-baselines](perf-baselines.md#hc-row-group)).
 - A GEMV that beats MLX's qmv in a chained in-graph ubench can still lose inside the forward: a vectorized affine-8
   reader 10-57% faster in-graph was 2-4% slower per decode forward on an M2 Max
-  ([perf-baselines](perf-baselines.md#m2max-decode)). Judge a decode kernel by the decode meter.
+  ([perf-baselines](perf-baselines.md#m2max-decode)). Judge a decode kernel by the decode meter. The affine-8 verify
+  rows kernel takes two output rows per simdgroup: four rows and four simdgroups won an isolated microbench and lost
+  in the forward ([perf-baselines](perf-baselines.md#mimo-verify-2p3)).
 - A dependent-kernel cut that REDISTRIBUTES a reduction into every threadgroup loses; a routing-independent chain
   the GPU already OVERLAPS is not a dispatch to fuse. Meter: `SUSHI_DECODE_FWD_UBENCH`.
 - A matmul2d decode tile of 16 query rows is latency-bound: its barriers and small matmuls cost more than its
@@ -80,6 +83,13 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   - A chunked chain is bit-identical to one dispatch on either arm.
   - Gate `attnPdNaxServes`: NAX + macOS 26.3 + a one-tile probe of both instantiations (causal, band + sinks)
     against an f32 reference; a failed probe declines by name. `SUSHI_ATTN_PD_NAX=0` = SIMD.
+- At 128k keys its time is ~69% matmul issue, ~18% load instructions (Q reloaded each key block, K/V fragments per
+  simdgroup) and ~12% softmax; K/V memory traffic is ~1% (`SUSHI_ATTN_PD_UBENCH_ABL=1`,
+  [perf-baselines](perf-baselines.md#mimo-longctx-prefill-attn)).
+- Each fragment row is ONE 8-byte vector load (`SushiNax::load2`); element-wise reads cost ~5% of the kernel
+  ([perf-baselines](perf-baselines.md#mimo-longctx-prefill-attn) has the ruled-out load layouts).
+- Contract: every q/k/v row the engine hands it starts 8-byte aligned (views slice only the token axis). A misaligned
+  row reads correctly on M5 (unit test), but a misaligned vector load is undefined in MSL.
 - Its PV feeds P as ONE f16 term (P is in [0, 1]; f16 keeps 11 bits): 16x512 KLD -0.19%, inside the rounding-flip
   floor ([quality-kld](quality-kld.md#the-standard-reading)). Parity bar: per element vs fp64 no
   worse than the SIMD kernel beyond a store rounding flip plus 2^-11 of max|V|. A float P operand into the relaxed
@@ -96,6 +106,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   for an hd-256 ARRAY mask (`splitMaskedSdpa256`).
 - Qwen4 HC + GDN prefill fusions take the chunk WIDTH as a scalar INPUT (`SUSHI_HC_PREFILL=0` /
   `SUSHI_GDN_PREFILL_FUSED=0`).
+- GDN prefill (S >= 64) takes one of three recurrences (`GdnRoute`): stock, blocked-seq, or oMLX's software-pipelined
+  kernel (mlx-serve #641; 8 lanes per value row, 12-token blocks prefetched), the default for qwen4_exp on NAX GPUs.
+  `SUSHI_GDN_PIPELINED=0` keeps the blocked kernel, `=1` forces it; not bit-identical (dot order).
 
 ## Verify lanes
 
@@ -119,6 +132,17 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   the stores ([engine-exl3-experts](engine-exl3-experts.md#kernels), 2.6x on the non-NAX GEMM).
 - Cooperative-only matmul2d takes M, N, K in {16, 32}, with at least one of them 32. Larger tiles are the 16x16
   fragments concatenated. A K=32 op runs no faster than two K=16 ops.
+- **Metal caps each compiled kernel's threads per threadgroup by its register use**; MLX throws at a dispatch above it.
+  M3 and later grant every kernel 1024, so an M5 never sees it; M1/M2 grant 1024 up to 52 GPRs, down to 384 at 128.
+  A group above 384 threads probes and declines (`sushi_gdn_verify_fold`), or its GPRs come from a `metal-tt` G13 build.
+- **A custom kernel whose source fails to compile kills the process** at its first eval (mlx-c `array.cpp:352`, exit
+  255). The JIT probe declines only kernels that build. Compile a new source offline first: wrap it in MLX's
+  custom-kernel template (inputs, their `_strides`, the attribute arguments, one instantiation per template set) and
+  run `xcrun -sdk macosx metal -std=metal4.0 -c -I lib/mlx/include`. That is CPU only and needs no GPU lock.
+- MSL takes no arrays of cooperative tensors ("cannot declare array of non-constant size type"). Name one per row:
+  `sushi_qkv_mpp_rows` expands a macro per row.
+- `matmul2d::run` and a cooperative tensor's `store` take lvalue tensors: bind a `slice<...>(...)` to a name before
+  passing it.
 
 ## Proving a kernel
 
@@ -156,4 +180,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   under-samples short kernels and mis-shares the rest ([perf-baselines](perf-baselines.md#m2max-decode)).
 - A Metal System Trace: `xcrun xctrace record --template 'Metal System Trace' --instrument 'Metal GPU Counters'
   --attach <pid>`, then export `metal-shader-profiler-intervals` (the profiler under-samples short kernels).
+- Time a prefill chunk with the load-time meter `SUSHI_PREFILL_UBENCH=N` (`_ROWS`, capped at the admitted chunk;
+  `_TEXT=<file>` for real routing; `_ARMS=0,1,0,1` alternates the EXL3 NAX reference and served bodies in one boot).
+- Time MiMo's prefill attention for one chunk with `SUSHI_ATTN_PD_UBENCH=1` (test filter "MiMo prefill attention per
+  chunk"). Knobs: `_QL`, `_KL` (empty skips the main table), `_BUDGETS`, `_LEAN`, `_REPS`; kernel variants on the
+  dense chain at `_ABL_KL` keys: `_ABL=1` (ablations) and `_ALT=<a.metal>,...` (replacement sources, byte-checked
+  against the served kernel).
 - Every timing run takes the GPU lock and restores QoS ([CLAUDE.md, Team process](../CLAUDE.md#team-process)).

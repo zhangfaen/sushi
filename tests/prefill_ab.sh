@@ -22,7 +22,10 @@ print(para*int('${PREFILL_AB_PARAS:-260}'))")
 
 arm() {
   local val="$1" label="$2"
-  pkill -f "sushi.*--port $PORT" 2>/dev/null; sleep 2
+  if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or set PORT" >&2
+    exit 1
+  fi
   env "$VAR=$val" "$BIN" --model "$MODEL" --serve --port "$PORT" >"$HOME/.sushi/runs/prefill-ab/$PORT-${label// /}.log" 2>&1 &
   local pid=$!
   for _ in $(seq 1 900); do

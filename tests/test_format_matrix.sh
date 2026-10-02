@@ -48,7 +48,7 @@ NC='\033[0m'
 # logical|display|path|engine|has_thinking|extra server flags
 MODELS=(
     "qwen4_exp|Qwen3.8 Flash-Next (think tags + XML tools)|${QWEN4_EXP_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}|mlx|yes|"
-    "mimo_v2|MiMo-V2.6-Flash (EXL3 experts)|${MIMO_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.5bpw}|mlx|yes|--no-vision"
+    "mimo_v2|MiMo-V2.6-Flash (EXL3 experts)|${MIMO_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.3bpw}|mlx|yes|--no-vision"
 )
 
 # FORMAT_MODELS=csv filter of logical names. Unknown names simply match
@@ -183,12 +183,15 @@ run_model() {
     fi
 
     local log="/tmp/test_format_matrix_$logical.log"
-    pkill -f "sushi.*--port $PORT" 2>/dev/null
-    sleep 1
+    if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+        echo "port $PORT is already in use; stop that server or set PORT" >&2
+        exit 1
+    fi
     # shellcheck disable=SC2086 # extra is a flag list
     "$BINARY" --model "$path" --serve --port "$PORT" --ctx-size 8192 \
         --log-level debug $extra > "$log" 2>&1 &
     local sp=$!
+    SERVER_PID=$sp
 
     # MoE models can take 90+ s on cold weight pages — allow 240 s.
     local up=0
@@ -201,6 +204,7 @@ run_model() {
         check "[$logical] server boots" 0
         echo "  server log tail:"; tail -10 "$log" | sed 's/^/    /'
         kill "$sp" 2>/dev/null
+        wait "$sp" 2>/dev/null
         return 1
     fi
     RAN=$((RAN + 1))
@@ -355,12 +359,12 @@ print(f"{name_ok}|{int(json_ok)}|{path_ok}|{leak}")')
     return 0
 }
 
-trap 'pkill -f "sushi.*--port $PORT" 2>/dev/null' EXIT
+SERVER_PID=""
+trap '[ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null' EXIT
 
 for entry in "${MODELS[@]}"; do
     IFS='|' read -r logical display path engine has_thinking extra <<< "$entry"
     run_model "$logical" "$display" "$path" "$engine" "$has_thinking" "$extra"
-    pkill -f "sushi.*--port $PORT" 2>/dev/null
     sleep 2
 done
 

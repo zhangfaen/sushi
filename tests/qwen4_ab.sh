@@ -13,11 +13,14 @@ PACK=${QWEN4_MODEL:-$HOME/.sushi/models/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit
 BIN=${SUSHI_BIN:-./zig-out/bin/sushi}
 PORT=${QWEN4_AB_PORT:-11414}
 LOG=$O/${mode}_$tag.log
-pkill -f "sushi --model.*--port $PORT"
-for i in $(seq 1 60); do lsof -nP -iTCP:$PORT -sTCP:LISTEN >/dev/null 2>&1 || break; sleep 2; done
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+  echo "port $PORT is already in use; stop that server or set QWEN4_AB_PORT" >&2
+  exit 1
+fi
 flags=(--max-concurrent 4 --prefix-cache-entries 0 --log-level info)
 [[ $mode == mtp ]] && flags+=(--mtp)
 nohup $BIN --model $PACK --serve --host 127.0.0.1 --port $PORT $flags "$@" > $LOG 2>&1 &
+SERVER_PID=$!
 for i in $(seq 1 200); do curl -s -m 2 localhost:$PORT/health >/dev/null && grep -q "Model ready" $LOG && break; sleep 3; done
 one() { echo "$1" | curl -s -m 1800 localhost:$PORT/v1/chat/completions -H 'content-type: application/json' -d @- | python3 -c "import sys,json; d=json.load(sys.stdin); t=d['timings']; print(f\"{t['predicted_per_second']:.1f}/{d['usage']['completion_tokens']}\")"; }
 agg() { python3 -c "
@@ -45,4 +48,4 @@ else
   done
   echo "batched engagements: $(grep -c 'gdn batched decode engaged' $LOG)"
 fi
-pkill -f "sushi --model.*--port $PORT"
+kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null

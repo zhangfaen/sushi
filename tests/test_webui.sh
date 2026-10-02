@@ -76,6 +76,14 @@ if boot; then
             "$(grep -qi '^Content-Type: text/html; charset=utf-8' "$WORK/headers" && echo 1 || echo 0)"
         check "GET $path body is the embedded page" "$(cmp -s "$WORK/body" "$PAGE" && echo 1 || echo 0)"
     done
+    check "tools pack is available to the local page" \
+        "$(curl -s -X POST "$BASE/v1/tools" -H "Origin: $BASE" -H 'Content-Type: application/json' -d '{}' | grep -q 'web_search' && echo 1 || echo 0)"
+    check "tools reject another page origin" \
+        "$(is "$(code -X POST "$BASE/v1/tools" -H 'Origin: http://evil.test' -d '{}')" 403)"
+    check "tools require a page origin" \
+        "$(is "$(code -X POST "$BASE/v1/tools" -d '{}')" 403)"
+    check "file tools refuse paths outside the server folder" \
+        "$(curl -s -X POST "$BASE/v1/tools" -H "Origin: $BASE" -H 'Content-Type: application/json' -d '{"name":"read_file","arguments":"{\"path\":\"../outside\"}"}' | grep -q 'refused' && echo 1 || echo 0)"
     check "POST / is 405" "$(is "$(code -X POST "$BASE/" -d '{}')" 405)"
     check "GET /health still answers ok" "$(is "$(curl -s "$BASE/health")" '{"status":"ok"}')"
     check "GET /v1/models still lists" "$(is "$(curl -s "$BASE/v1/models")" '{"object":"list","data":[]}')"
@@ -90,6 +98,10 @@ fi
 
 echo "[2/3] --api-key --api-key-strict: page open, API behind the key"
 if boot --api-key webui-test-key --api-key-strict; then
+    check "tools require the configured API key" \
+        "$(is "$(code -X POST "$BASE/v1/tools" -H "Origin: $BASE" -d '{}')" 401)"
+    check "tools accept the configured API key" \
+        "$(is "$(code -X POST "$BASE/v1/tools" -H "Origin: $BASE" -H 'Authorization: Bearer webui-test-key' -d '{}')" 200)"
     check "GET / needs no key" "$(is "$(code "$BASE/")" 200)"
     check "GET /chat needs no key" "$(is "$(code "$BASE/chat")" 200)"
     check "GET /v1/models without the key is 401" "$(is "$(code "$BASE/v1/models")" 401)"

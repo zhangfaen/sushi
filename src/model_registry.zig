@@ -561,6 +561,9 @@ pub const ModelRegistry = struct {
     /// Cap on summed bytes_resident across `.ready` entries.
     /// 0 disables the byte cap (count cap still applies).
     max_resident_mem: u64,
+    /// An explicit `--max-resident-mem` binds a model loading alone too; the auto cap only bounds
+    /// co-residence, and a sole model is the load preflight's call.
+    mem_cap_binds_alone: bool = true,
     /// When non-null, `server.idleEvictLoop` evicts `.ready` entries with
     /// refcount == 0 whose `last_used_ms` is older than this window. Read
     /// there, not here — the registry only carries the setting.
@@ -732,15 +735,7 @@ pub const ModelRegistry = struct {
 
         // Fast path: already registered (discovered, --model, or a previous
         // register-by-path). No filesystem touch.
-        {
-            self.mutex.lockUncancelable(io);
-            defer self.mutex.unlock(io);
-            if (self.entries.get(base)) |existing| return existing.id;
-        }
-
-        // A discovery entry may hold this path under an org/name id whose
-        // basename differs — resolve by path before probing the filesystem.
-        if (self.peekByPath(trimmed)) |existing| return existing.id;
+        if (self.peekPath(trimmed)) |existing| return existing.id;
 
         const probe = try model_discovery.probeModelDir(io, self.allocator, trimmed);
         defer self.allocator.free(probe.model_type);
@@ -778,6 +773,18 @@ pub const ModelRegistry = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         return self.peekByPathLocked(path);
+    }
+
+    /// The entry a model-directory path names: the one AT that path (a
+    /// discovery entry's org/name id differs from the basename), else the one
+    /// registered under its basename. `/v1/load-model` and request routing
+    /// both resolve a path here, so they cannot disagree on the model.
+    pub fn peekPath(self: *ModelRegistry, path: []const u8) ?*LoadedModel {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.peekByPathLocked(path)) |e| return e;
+        const base = std.fs.path.basename(std.mem.trimEnd(u8, path, "/"));
+        return if (base.len == 0) null else self.entries.get(base);
     }
 
     fn peekByPathLocked(self: *ModelRegistry, path: []const u8) ?*LoadedModel {
@@ -1162,6 +1169,7 @@ pub const ModelRegistry = struct {
             if (mem_ok and count_ok) return n;
 
             const victim = self.pickLruEvictable(exclude_id) orelse {
+                if (count_ok and self.loadsAloneLocked(exclude_id, freed)) return n;
                 // Can't satisfy the caps — roll back every marking we made.
                 for (out[0..n]) |v| self.unmarkEvictingLocked(v);
                 return null;
@@ -1177,6 +1185,13 @@ pub const ModelRegistry = struct {
         }
     }
 
+    /// Past the planned evictions nothing else is resident or reserved, and the cap allows a sole model.
+    fn loadsAloneLocked(self: *ModelRegistry, id: []const u8, freed: u64) bool {
+        if (self.mem_cap_binds_alone) return false;
+        const entry = self.entries.get(id) orelse return false;
+        return (self.current_resident_bytes -| freed) == 0 and self.reserved_bytes == entry.load_estimate;
+    }
+
     /// Map a stored load-failure name back to the typed error `ensureLoaded`
     /// surfaces. A memory-preflight refusal keeps its identity so the HTTP
     /// layer answers with a named 503 instead of the generic "Model load
@@ -1188,7 +1203,7 @@ pub const ModelRegistry = struct {
     /// (2026-08-08). Merge note: this arm came from the branch's
     /// `scheduler.loadErrorFor`, which this function replaced — the name-based
     /// half survived the refactor, the second name did not.
-    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory, ArchitectureUnsupported, ModelFormatUnsupported, ExpertCacheDoesNotFit, ExpertStreamingRequired, SsdBudgetBelowResident, SsdBudgetExceedsWiredLimit, ExpertStreamingMtpUnsupported, ExpertStreamingUnsupportedLayout, ExpertSlabImportCopied, ExpertLayoutUnsupported, Exl3TopKExceedsReduceBank, Exl3TrellisGeometry, Exl3WindowUnsupported, Exl3ShardStampMismatch } {
+    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory, ArchitectureUnsupported, ModelFormatUnsupported, ExpertCacheDoesNotFit, ExpertStreamingRequired, SsdBudgetBelowResident, SsdBudgetExceedsWiredLimit, ExpertStreamingMtpUnsupported, ExpertStreamingUnsupportedLayout, ExpertSlabImportCopied, ExpertLayoutUnsupported, Exl3TopKExceedsReduceBank, Exl3TrellisGeometry, Exl3WindowUnsupported, Exl3ShardStampMismatch, Exl3RateGroupsStreamingUnsupported, Exl3NonuniformStreamingUnsupported, Exl3GateUpRateMismatch } {
         if (name) |n| {
             if (std.mem.eql(u8, n, "InsufficientMemory")) return error.InsufficientMemory;
             if (std.mem.eql(u8, n, "ArchitectureUnsupported")) return error.ArchitectureUnsupported;
@@ -1204,6 +1219,9 @@ pub const ModelRegistry = struct {
             if (std.mem.eql(u8, n, "ExpertLayoutUnsupported")) return error.ExpertLayoutUnsupported;
             if (std.mem.eql(u8, n, "Exl3TopKExceedsReduceBank")) return error.Exl3TopKExceedsReduceBank;
             if (std.mem.eql(u8, n, "Exl3TrellisGeometry")) return error.Exl3TrellisGeometry;
+            if (std.mem.eql(u8, n, "Exl3RateGroupsStreamingUnsupported")) return error.Exl3RateGroupsStreamingUnsupported;
+            if (std.mem.eql(u8, n, "Exl3NonuniformStreamingUnsupported")) return error.Exl3NonuniformStreamingUnsupported;
+            if (std.mem.eql(u8, n, "Exl3GateUpRateMismatch")) return error.Exl3GateUpRateMismatch;
             if (std.mem.eql(u8, n, "Exl3WindowUnsupported")) return error.Exl3WindowUnsupported;
             if (std.mem.eql(u8, n, "Exl3ShardStampMismatch")) return error.Exl3ShardStampMismatch;
         }
@@ -1930,6 +1948,47 @@ test "planEvictions: returns null and rolls back when every victim is pinned" {
     reg.mutex.unlock(io);
     try testing.expectEqual(@as(u64, 0), reg.reserved_bytes);
     a.refcount.store(0, .release);
+}
+
+test "planEvictions: the auto memory cap bounds co-residence; a model alone past it is the load preflight's call" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 10, 100, null);
+    defer reg.deinit();
+    reg.mem_cap_binds_alone = false;
+    _ = try makeReadyStub(reg, "a", 40);
+    const big = try beginLoad(reg, "big", 120); // over the cap even alone
+    reg.mutex.lockUncancelable(io);
+    var buf: [16]*LoadedModel = undefined;
+    // Every other model goes first, then the sole load proceeds to its own preflight.
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(big.id, &buf));
+    try testing.expectEqualStrings("a", buf[0].id);
+    reg.unmarkEvictingLocked(buf[0]);
+    // A pinned model stays resident, so the load would co-reside past the cap: refused.
+    _ = buf[0].refcount.fetchAdd(1, .acq_rel);
+    try testing.expectEqual(@as(?usize, null), reg.planEvictionsLocked(big.id, &buf));
+    _ = buf[0].refcount.fetchSub(1, .acq_rel);
+    // An explicit cap binds a sole model too.
+    reg.mem_cap_binds_alone = true;
+    try testing.expectEqual(@as(?usize, null), reg.planEvictionsLocked(big.id, &buf));
+    reg.markUnloadedLocked(big);
+    reg.mutex.unlock(io);
+}
+
+test "planEvictions: under the auto cap a load is not alone while another load's reservation is in flight" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 10, 100, null);
+    defer reg.deinit();
+    reg.mem_cap_binds_alone = false;
+    const first = try beginLoad(reg, "first", 60); // reserved, not yet resident
+    const second = try beginLoad(reg, "second", 120);
+    reg.mutex.lockUncancelable(io);
+    defer reg.mutex.unlock(io);
+    var buf: [16]*LoadedModel = undefined;
+    try testing.expectEqual(@as(?usize, null), reg.planEvictionsLocked(second.id, &buf));
+    reg.markUnloadedLocked(first);
+    // With the other reservation gone, the same load is alone and passes to its preflight.
+    try testing.expectEqual(@as(?usize, 0), reg.planEvictionsLocked(second.id, &buf));
+    reg.markUnloadedLocked(second);
 }
 
 test "reservation: concurrent in-flight load is visible in the budget gate" {

@@ -12,10 +12,10 @@
 #
 # Configs: default (kv8) | off (--kv-quant off) | kv4 (--kv-quant 4) | kv8 (--kv-quant 8) | mtp (--mtp, only
 # where the pack ships a head and does not stream) | nospec (--no-pld --no-mtp
-# --no-drafter). The MiMo EXL3 pack serves resident; MIMO_SSD_BUDGET_GB adds
-# --ssd-budget-gb for a streamed MiMo checkpoint.
+# --no-drafter). The MiMo EXL3 pack serves resident with its vision tower and MTP heads;
+# MIMO_SSD_BUDGET_GB adds --ssd-budget-gb for a streamed MiMo checkpoint, which skips mtp.
 # Per boot: chat non-stream/stream, thinking on/off, tools, json_schema,
-# logprobs, max_tokens cap, prefix-cache hit, 2-way concurrency, /v1/completions,
+# logprobs, max_tokens cap, ignore_eos (completions: stream == non-stream; chat: 400), prefix-cache hit, 2-way concurrency, /v1/completions,
 # /v1/messages (both modes), /v1/responses (both modes), /v1/models,
 # /metrics.json.
 set -uo pipefail
@@ -34,7 +34,7 @@ MD="$HOME/.sushi/models"
 # arch|thinking(yes/no)|candidate paths (first that exists wins)
 ARCHES=(
     "qwen4_exp|yes|${QWEN4_EXP_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}|$MD/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-iQ-MLX-3.3bpw"
-    "mimo_v2|yes|${MIMO_STREAM_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.5bpw}"
+    "mimo_v2|yes|${MIMO_STREAM_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.3bpw}"
 )
 CONFIGS="${SMOKE_CONFIGS:-default,off,kv4,mtp,nospec}"
 
@@ -73,7 +73,8 @@ boot() { # $1 model path, $2... extra flags
 stop() {
     [[ -n "$SERVER_PID" ]] || return
     kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; SERVER_PID=""
-    pkill -f "zig-out/bin/sushi.*--port $PORT" 2>/dev/null || true
+    # macOS hands an exited server's GPU memory back seconds later; the next boot's preflight reads free RAM.
+    sleep "${SMOKE_SETTLE_S:-10}"
 }
 trap stop EXIT
 
@@ -170,6 +171,25 @@ print(json.dumps({"c":c,"rc":rc}))' 2>/dev/null)
     # A model that finishes under the cap (Spark: "Blue") reports stop; the invariant is the cap.
     fr=$(echo "$r" | J 'd["choices"][0]["finish_reason"]')
     check "max_tokens 5: <=5 tokens, finish_reason length|stop" "$([[ ( "$fr" == length || "$fr" == stop ) && "$(echo "$r" | J 'd["usage"]["completion_tokens"]')" -le 5 ]] && echo 0 || echo 1)" "$(echo "$r" | head -c 200)"
+    # ignore_eos: a completion that would stop early runs on to max_tokens, and the stream carries the same bytes;
+    # chat refuses the field by name.
+    local ie="{\"model\":\"m\",\"prompt\":\"Q: What colour is the sky on a clear day? A:\",\"max_tokens\":48,\"temperature\":0,\"ignore_eos\":true"
+    r=$(post /v1/completions "$ie}")
+    check "ignore_eos: completion runs 48 tokens, finish_reason length" "$([[ "$(echo "$r" | J 'd["choices"][0]["finish_reason"]')" == length && "$(echo "$r" | J 'd["usage"]["completion_tokens"]')" == 48 ]] && echo 0 || echo 1)" "$(echo "$r" | head -c 300)"
+    c=$(echo "$r" | J 'repr(d["choices"][0]["text"])')
+    rc=$(curl -sN --max-time 300 "$BASE/v1/completions" -H "Content-Type: application/json" -d "$ie,\"stream\":true}" | python3 -c '
+import sys,json
+t=""
+for l in sys.stdin:
+    l=l.strip()
+    if not l.startswith("data: ") or l=="data: [DONE]": continue
+    for ch in json.loads(l[6:]).get("choices",[]):
+        t+=ch.get("text") or ""
+print(repr(t))' 2>/dev/null)
+    check "ignore_eos: completion stream == non-stream bytes" "$([[ -n "$c" && "$c" == "$rc" ]] && echo 0 || echo 1)" "ns=${c:0:120} st=${rc:0:120}"
+    r=$(curl -s -o /dev/null -w '%{http_code}' --max-time 60 "$BASE/v1/chat/completions" -H "Content-Type: application/json" \
+        -d "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$Q\"}],\"max_tokens\":8,\"ignore_eos\":true}")
+    check "ignore_eos: chat refuses it with a 400" "$([[ "$r" == 400 ]] && echo 0 || echo 1)" "status=$r"
     r=$(post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$Q\"}],\"max_tokens\":600,\"temperature\":0,\"logprobs\":true,\"top_logprobs\":2,\"enable_thinking\":false}")
     c=$(echo "$r" | J 'd["choices"][0]["message"]["content"] or ""')
     if [[ -z "$c" ]]; then skip "logprobs: entries with top_logprobs" "no content to describe"
@@ -241,7 +261,7 @@ for entry in "${ARCHES[@]}"; do
     if [[ "$MAX_GB" -gt 0 && "$gb" -gt "$MAX_GB" ]]; then CELL="$arch"; skip "$arch" "${gb} GB > SMOKE_MAX_GB=$MAX_GB"; continue; fi
 
     arch_flags=()
-    [[ "$arch" == mimo_v2 ]] && arch_flags=(${MIMO_SSD_BUDGET_GB:+--ssd-budget-gb "$MIMO_SSD_BUDGET_GB"} --no-vision)
+    [[ "$arch" == mimo_v2 ]] && arch_flags=(${MIMO_SSD_BUDGET_GB:+--ssd-budget-gb "$MIMO_SSD_BUDGET_GB"})
 
     for cfg in "${WANT_CFG[@]}"; do
         CELL="$arch.$cfg"
@@ -251,7 +271,7 @@ for entry in "${ARCHES[@]}"; do
             off)     flags+=(--kv-quant off) ;;
             kv4)     flags+=(--kv-quant 4) ;;
             kv8)     flags+=(--kv-quant 8) ;;
-            mtp)     [[ "$arch" == mimo_v2 ]] && { skip "$CELL" "streamed experts refuse MTP"; continue; }
+            mtp)     [[ "$arch" == mimo_v2 && -n "${MIMO_SSD_BUDGET_GB:-}" ]] && { skip "$CELL" "streamed experts refuse MTP"; continue; }
                      has_mtp_head "$model" || { skip "$CELL" "no MTP head"; continue; }; flags+=(--mtp) ;;
             nospec)  flags+=(--no-pld --no-mtp --no-drafter) ;;
             *) skip "$CELL" "unknown config"; continue ;;

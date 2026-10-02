@@ -231,6 +231,34 @@ const shell_tool_schema =
 ;
 
 const corpus = [_]Expect{
+    .{
+        .family = "qwen",
+        .name = "explanation cannot become an XML function name",
+        .raw = "A `<tool_call>` body carrying `<function=` uses XML. See `<tool_call>`.",
+        .no_tool_calls = true,
+    },
+    .{
+        .family = "hermes",
+        .name = "JSON nameless call is not executable",
+        .raw = "<tool_call>{\"name\":\"\",\"arguments\":{}}</tool_call>",
+        .no_tool_calls = true,
+    },
+    .{
+        .family = "qwen",
+        .name = "documentation placeholder is not a callable function",
+        .raw = "The XML format uses `<tool_call><function=></function></tool_call>`.",
+        .no_tool_calls = true,
+    },
+    .{
+        .family = "qwen",
+        .name = "nameless call does not discard a valid sibling",
+        .raw = "<tool_call>{\"name\":\" \",\"arguments\":{}}</tool_call>" ++
+            "<tool_call><function=read_file><parameter=path>README.md</parameter></function></tool_call>",
+        .tool_name = "read_file",
+        .tool_count = 1,
+        .tool_arg_key = "path",
+        .tool_arg_value = "README.md",
+    },
     // ── Qwen 3.5/3.6 (<think> family, template-injected opener) ─────────────
     .{
         .family = "qwen",
@@ -315,6 +343,32 @@ const corpus = [_]Expect{
         .tool_name = "shell",
         .tool_arg_key = "command",
         .tool_arg_value = "mkdir -p src/app",
+    },
+    // ── MiMo-V2.6 (<think> family, the model opens its own block) ───────────
+    // Shaped as the checkpoint's own template renders an assistant turn:
+    // `<think>R</think>` then content, tool calls unframed inside
+    // `<tool_call><function=N><parameter=K>V</parameter></function></tool_call>`.
+    .{
+        .family = "mimo",
+        .name = "model-opened think block, then the answer",
+        .raw = "<think>17*20=340, 17*3=51, so 391.</think>17 × 23 = 391.",
+        .thinking = true,
+        .content_exact = "17 × 23 = 391.",
+        .reasoning_contains = "17*20=340",
+    },
+    .{
+        .family = "mimo",
+        .name = "think block, then an unframed XML tool call",
+        .raw = "<think>Need the weather.</think><tool_call><function=get_weather><parameter=city>Paris</parameter>" ++
+            "<parameter=celsius>true</parameter></function></tool_call>",
+        .thinking = true,
+        .reasoning_contains = "Need the weather.",
+        .tool_name = "get_weather",
+        .tool_arg_key = "city",
+        .tool_arg_value = "Paris",
+        .tools_json = weather_tool_schema,
+        .tool_bool_key = "celsius",
+        .tool_bool_value = true,
     },
     // ── Gemma 4 (<|channel> family, call:name{...} tools) ───────────────────
     .{
@@ -1940,6 +1994,9 @@ test "format corpus: recorded model outputs across families" {
                 // `<|content_text|>bash` reached pi, whose "Tool ... not found"
                 // error taught the model to echo the garbage name back into its
                 // own payloads — a self-reinforcing loop the parser started.
+                if (std.mem.trim(u8, tc.name, " \t\r\n").len == 0) {
+                    try fail(entry, "tool NAME is empty", tc.name);
+                }
                 if (std.mem.indexOf(u8, tc.name, "<|") != null) {
                     try fail(entry, "tool NAME carries a channel marker", tc.name);
                 }
@@ -2431,6 +2488,15 @@ const dialects = [_]Dialect{
         .value = "a.txt",
     },
     .{
+        // The checkpoint's own template renders parameter values with no newline framing.
+        .family = "mimo-v2.6",
+        .dialect = "tool_call wrapper + unframed <function=> body",
+        .raw = "<tool_call><function=write_file><parameter=path>a.txt</parameter><parameter=content>hi</parameter></function></tool_call>",
+        .name = "write_file",
+        .key = "path",
+        .value = "a.txt",
+    },
+    .{
         .family = "lfm2",
         .dialect = "pythonic call expression",
         .raw = "<|tool_call_start|>[write_file(path=\"a.txt\", content=\"hi\")]<|tool_call_end|>",
@@ -2508,6 +2574,7 @@ test "format corpus: a parameter VALUE never decides the call" {
     const shapes = [_]Shape{
         .{ .pre = "<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n<parameter=content>\n", .post = "\n</parameter>\n</function>\n</tool_call>" },
         .{ .pre = "<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n<parameter=content>\n", .post = "\n</parameter>\n</function>" },
+        .{ .pre = "<tool_call><function=write_file><parameter=path>a.txt</parameter><parameter=content>", .post = "</parameter></function></tool_call>" },
     };
 
     for (shapes) |shape| {
@@ -2737,6 +2804,7 @@ test "format corpus: a system turn past index 0 reaches the prompt once, on ever
     const cases = [_]Case{
         .{ .name = "qwen3.8", .tpl = @embedFile("fixtures/qwen38_chat_template.jinja"), .system_headers = 1 },
         .{ .name = "qwen3.8-27b", .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .system_headers = 1 },
+        .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja"), .system_headers = 2 },
         .{ .name = "role loop", .tpl = chatml, .system_headers = 2 },
     };
     const messages = [_]chat.Message{
@@ -3000,4 +3068,94 @@ test "format corpus: streamed reasoning adds up to the non-stream reasoning, on 
         try testing.expectEqualStrings(want, got[0]);
         try testing.expectEqualStrings(want, got[1]);
     }
+}
+
+/// Streams `raw` cut by the length limit after `cut` bytes, the way each stream
+/// path does, and returns (tools path, no-tools path) reasoning deltas joined. A
+/// thought the model opens arrives as one `<think>` token, every later byte as a token.
+fn streamCutThought(allocator: std.mem.Allocator, raw: []const u8, cut: usize, opened: bool) ![2][]u8 {
+    const first: usize = if (opened) 0 else "<think>".len;
+
+    var tools = std.ArrayList(u8).empty;
+    errdefer tools.deinit(allocator);
+    var streamed: usize = 0;
+    for (@max(first, 1)..cut + 1) |i| {
+        const rc = chat.splitThinkBlock(raw[0..i], true, opened).reasoning_content orelse "";
+        const ready = if (i == cut) rc else chat.settledReasoning(rc);
+        if (chat.unstreamedReasoning(ready, streamed)) |fresh| {
+            try tools.appendSlice(allocator, fresh);
+            streamed = ready.len;
+        }
+    }
+
+    var plain = std.ArrayList(u8).empty;
+    errdefer plain.deinit(allocator);
+    var held = std.ArrayList(u8).empty;
+    defer held.deinit(allocator);
+    if (!opened) try held.appendSlice(allocator, chat.modelThinkOpener(false, raw[0..first]).?);
+    var consumed = false;
+    var shipped = false;
+    for (raw[first..cut]) |byte| {
+        try held.append(allocator, byte);
+        if (!consumed and (held.items.len >= "<think>".len or !chat.thinkOpenerPossible(held.items))) {
+            consumed = true;
+            const l = chat.thinkOpenTagLenAt(held.items) orelse 0;
+            std.mem.copyForwards(u8, held.items[0 .. held.items.len - l], held.items[l..]);
+            held.shrinkRetainingCapacity(held.items.len - l);
+        }
+        if (!consumed) continue;
+        const flush = chat.openThoughtFlush(held.items, shipped);
+        try plain.appendSlice(allocator, held.items[flush.skip..][0..flush.ship]);
+        if (flush.ship > 0) shipped = true;
+        const keep = held.items[flush.skip + flush.ship ..];
+        std.mem.copyForwards(u8, held.items[0..keep.len], keep);
+        held.shrinkRetainingCapacity(keep.len);
+    }
+    try plain.appendSlice(allocator, chat.cutThoughtDelta(held.items, consumed, shipped));
+    return .{ try tools.toOwnedSlice(allocator), try plain.toOwnedSlice(allocator) };
+}
+
+test "format corpus: a thought cut by the length limit streams the non-stream reasoning, on both stream paths" {
+    // `max_tokens: 1` on MiMo streamed its lone `<think>` opener as reasoning while
+    // the non-stream reply carried none. Every cut, the opener's own included, must
+    // stream the split's bytes; a surface that opens its reasoning block or item at
+    // the first delta then opens one exactly when the non-stream reply has reasoning.
+    const allocator = testing.allocator;
+    const Case = struct { raw: []const u8, opened: bool };
+    var cases = std.ArrayList(Case).empty;
+    defer cases.deinit(allocator);
+    for (corpus) |e| {
+        if (std.mem.count(u8, e.raw, "</think>") != 1) continue;
+        if (chat.streamShouldBufferForTools(e.raw[0..std.mem.indexOf(u8, e.raw, "</think>").?])) continue;
+        const opens = std.mem.startsWith(u8, e.raw, "<think>");
+        if (!opens and !e.opened_by_template) continue;
+        try cases.append(allocator, .{ .raw = e.raw, .opened = !opens });
+    }
+    const edges = [_]Case{
+        .{ .raw = "<think>Okay, 17 times 23.</think>391", .opened = false },
+        .{ .raw = "<think>\n\nBlank lines first.\n</think>x", .opened = false },
+        .{ .raw = "<think> </think>", .opened = false },
+        .{ .raw = "\n\nLeading blank lines.\n</think>A", .opened = true },
+        .{ .raw = "Ok</think>", .opened = true },
+        .{ .raw = "Trailing spaces  \n </think>x", .opened = true },
+    };
+    try cases.appendSlice(allocator, &edges);
+    try testing.expect(cases.items.len > edges.len);
+    for (cases.items) |c| {
+        const first: usize = if (c.opened) 1 else "<think>".len;
+        const end = std.mem.indexOf(u8, c.raw, "</think>").? + "</think>".len;
+        for (first..end) |cut| {
+            const want = chat.splitThinkBlock(c.raw[0..cut], true, c.opened).reasoning_content orelse "";
+            const got = try streamCutThought(allocator, c.raw, cut, c.opened);
+            defer for (got) |g| allocator.free(g);
+            errdefer std.debug.print("\nraw: {s}\ncut: {d}\nwant: {any}\ntools: {any}\nplain: {any}\n", .{ c.raw, cut, want, got[0], got[1] });
+            try testing.expectEqualStrings(want, got[0]);
+            try testing.expectEqualStrings(want, got[1]);
+        }
+    }
+}
+
+
+test "format corpus: tokenizer rules are model-local across Unicode scripts" {
+    try @import("tokenizer.zig").checkTokenizerRuleFixtures();
 }

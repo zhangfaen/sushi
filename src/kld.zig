@@ -36,6 +36,8 @@ pub const Options = struct {
     kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense,
     expert_cache_bytes: u64 = 0,
     ssd_budget_bytes: u64 = 0,
+    pick_tolerance: f32 = 0,
+    wired_margin_bytes: u64 = 0,
     enable_mtp: bool = false,
     mtp_explicit: bool = false,
     /// `SUSHI_HIDDEN_OUT`: capture appends each prompt forward's block boundaries here.
@@ -52,6 +54,7 @@ pub const ArgError = error{
     MissingPrompts,
     MissingOut,
     MissingFixture,
+    TeacherMustBeLossless,
 };
 
 const ValueFlag = enum {
@@ -68,6 +71,8 @@ const ValueFlag = enum {
     kv_quant,
     ssd_budget_gb,
     expert_cache_gb,
+    expert_pick_tolerance,
+    wired_margin_gib,
 };
 
 fn valueFlag(name: []const u8) ?ValueFlag {
@@ -85,6 +90,8 @@ fn valueFlag(name: []const u8) ?ValueFlag {
         .{ "--kv-quant", .kv_quant },
         .{ "--ssd-budget-gb", .ssd_budget_gb },
         .{ "--expert-cache-gb", .expert_cache_gb },
+        .{ "--expert-pick-tolerance", .expert_pick_tolerance },
+        .{ "--wired-margin-gib", .wired_margin_gib },
     };
     for (table) |row| if (std.mem.eql(u8, name, row[0])) return row[1];
     return null;
@@ -136,6 +143,8 @@ pub fn parseArgs(args: []const []const u8) ArgError!Options {
                 .kv_quant => o.kv_quant_config = transformer_mod.KVQuantConfig.fromJsonValue(.{ .string = v }) orelse return error.BadFlagValue,
                 .ssd_budget_gb => o.ssd_budget_bytes = server_mod.parseSsdBudgetGb(v) catch return error.BadFlagValue,
                 .expert_cache_gb => o.expert_cache_bytes = server_mod.parseExpertCacheGb(v) catch return error.BadFlagValue,
+                .expert_pick_tolerance => o.pick_tolerance = expert_stream_mod.parsePickTolerance(v) catch return error.BadFlagValue,
+                .wired_margin_gib => o.wired_margin_bytes = server_mod.parseWiredMarginGib(v) catch return error.BadFlagValue,
             }
         } else {
             return error.UnknownFlag;
@@ -147,6 +156,7 @@ pub fn parseArgs(args: []const []const u8) ArgError!Options {
         .capture => {
             if (o.prompts.len == 0) return error.MissingPrompts;
             if (o.out_dir.len == 0) return error.MissingOut;
+            if (o.pick_tolerance > 0) return error.TeacherMustBeLossless;
         },
         .compare => {
             if (o.fixture.len == 0) return error.MissingFixture;
@@ -180,6 +190,8 @@ pub const USAGE =
     \\  --ssd-budget-gb <n>   bf16 expert streaming budget (GiB)
     \\  --expert-cache-gb <n> bf16 expert cache size (GB), outranks --ssd-budget-gb
     \\  --mtp                 keep the MTP head resident (refused under streaming)
+    \\  --expert-pick-tolerance <n>  compare only, LOSSY: swap a missed streamed expert for a cached one within n (0..0.6)
+    \\  --wired-margin-gib <n>  headroom under iogpu.wired_limit_mb (integers 2..32)
     \\
 ;
 
@@ -1367,6 +1379,7 @@ pub fn runCompare(io: std.Io, allocator: std.mem.Allocator, l: *Loaded, opts: Op
         try writeJsonString(w, opts.fixture);
         try w.writeAll(",\n  \"kv_cache_format\": ");
         try writeJsonString(w, kvCacheFormat(opts.kv_quant_config));
+        try w.print(",\n  \"expert_pick_tolerance\": {d}", .{opts.pick_tolerance});
         try w.writeAll(",\n  ");
         try writeMemoryReportFields(w, memory);
         try w.print(",\n  \"mean_kld\": {d},\n  \"mean_top1\": {d},\n  \"mean_nll\": {d},\n  \"mean_cosine_similarity\": {d},\n  \"mean_cosine_loss\": {d},\n  \"worst_cosine_loss\": {d},\n  \"positions\": {d}", .{
@@ -1447,6 +1460,8 @@ pub fn cmdKld(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8
         opts.hidden_out = dir;
         log.info("[kld] {s}: appending every prompt forward's block boundaries to {s}\n", .{ hidden_capture.ENV_VAR, dir });
     };
+    expert_stream_mod.pick_tolerance = opts.pick_tolerance;
+    if (opts.wired_margin_bytes > 0) server_mod.wired_limit_margin_bytes = opts.wired_margin_bytes;
     const loaded = try loadModel(io, allocator, opts);
     defer loaded.deinit();
     switch (opts.command) {
@@ -1861,6 +1876,16 @@ test "kld: the argument parser reads every flag and refuses an unknown one" {
     try testing.expectEqual(@as(u32, 64), compare.tokens);
     const with_mtp = try parseArgs(&.{ "compare", "--model", "/models/pack", "--fixture", "/fixtures/teacher", "--mtp" });
     try testing.expect(with_mtp.enable_mtp);
+
+    const routed = try parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f", "--expert-pick-tolerance", "0.3", "--wired-margin-gib", "5" });
+    try testing.expectEqual(@as(f32, 0.3), routed.pick_tolerance);
+    try testing.expectEqual(@as(u64, 5) << 30, routed.wired_margin_bytes);
+    try testing.expectError(error.BadFlagValue, parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f", "--expert-pick-tolerance", "0.7" }));
+    try testing.expectError(error.BadFlagValue, parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f", "--wired-margin-gib", "1" }));
+
+    try testing.expectError(error.TeacherMustBeLossless, parseArgs(&.{ "capture", "--model", "/m", "--prompts", "/p", "--out", "/o", "--expert-pick-tolerance", "0.3" }));
+    const exact_capture = try parseArgs(&.{ "capture", "--model", "/m", "--prompts", "/p", "--out", "/o", "--expert-pick-tolerance", "0" });
+    try testing.expectEqual(@as(f32, 0), exact_capture.pick_tolerance);
 
     try testing.expectError(error.UnknownFlag, parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f", "--nope" }));
     try testing.expectError(error.UnknownFlag, parseArgs(&.{ "capture", "--model=/m" }));

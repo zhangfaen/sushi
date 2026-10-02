@@ -3,34 +3,30 @@ name: release
 description: sushi pre-release validation checklist, SemVer versioning, release steps, and CHANGELOG style. Use when preparing or cutting a release, running pre-release validation, or writing CHANGELOG entries.
 ---
 
-## Pre-release validation — ALWAYS run this, same process every time
+## Pre-release validation
 
-On the Apple M5 Max 128 GB (the only machine that records numbers), on the FINAL release tree, with a fresh
-`zig build -Doptimize=ReleaseFast`. Every step that loads a model takes the GPU lock and follows the thermal protocol
-in CLAUDE.md (Team process); nothing else runs during step 3.
+On the Apple M5 Max 128 GB, on the FINAL release tree, with a fresh `zig build -Doptimize=ReleaseFast`. Run the steps
+directly, one at a time: no driver script, no pause/resume bookkeeping. A failed step goes to the owner before anything
+else. Model loads take the GPU lock; step 2 waits for a quiet box (no builds, no AirDrop or other transfers).
 
 | # | Step | Command | Pass |
 |---|---|---|---|
-| 1 | Hermetic suite | `zig build test -Doptimize=ReleaseFast` | 0 fail |
-| 2 | Binary | `zig build -Doptimize=ReleaseFast`; `sushi --version` | names `build.zig.zon`'s version; ≈ 10 MB (Debug is 2–4× slower = fake regression) |
-| 3 | **Perf gate** | `./tests/bench.sh --tag v<ver>` (Sushi-4bpw only) | within noise of the previous column in `benchmarks.md`, mode suffix present; append this release's column |
-| 4 | **KLD gate** | `sushi kld compare` 16x512 to first EOS for every published pack | within ~1% of its row in `docs/quality-kld.md` (the noise floor) |
-| 5 | Tool-call correctness | `zig build test -Dtest-filter="format corpus"`, `-Dtest-filter="tool traffic"`; live `./tests/test_format_matrix.sh` | all pass |
-| 6 | API conformance | `npx llmprobe@latest http://127.0.0.1:<port>/v1 --quick` | 100% engine conformance |
-| 7 | Live regressions | `test_qwen4_exp.sh`, `test_mtp_equivalence.sh`, `test_prefix_cache_*.sh`, `test_smoke_matrix.sh`, `test_anthropic_api.sh`, `test_stream_keepalive.sh`, `test_disconnect_cancel.sh` | all pass |
-| 8 | Soak (bigger releases) | `SOAK_DURATION_HOURS=1 ./tests/test_soak_24h.sh` | RSS drift < 10% |
-| 9 | CI | `gh workflow run ci.yml --ref main` on the release commit | green (the macOS 26.2 build gate) |
-| 10 | Packs | each HF pack repo holds the shards, `ngram_table.bin` and its model card | card numbers match `docs/quality-kld.md` |
-| 11 | Cross-engine (only before a public claim) | start each engine yourself, `./tests/bench.sh --url <host:port> -m <id> --full` | recorded in `~/.sushi/runs/bench-<tag>/`, engine named beside every win |
+| 1 | Suite + binary | `zig build test -Doptimize=ReleaseFast`; `zig build -Doptimize=ReleaseFast`; `sushi --version` | 0 fail; names `build.zig.zon`'s version |
+| 2 | **Perf gate** | `./tests/bench.sh --tag v<ver> --only sushi-4bpw` | within noise of the previous column in `benchmarks.md`, mode suffix present; append this release's column |
+| 3 | **KLD gate** | `sushi kld compare` 16x512 to first EOS on one Sushi pack and MiMo | within ~1% of its row in `docs/quality-kld.md` |
+| 4 | Live | `test_format_matrix.sh`, `llmprobe --quick`, `test_smoke_matrix.sh`, plus the live test of each area the release changed | all pass |
+| 5 | CI | `gh workflow run ci.yml --ref main` on the release commit | green (the macOS 26.2 build gate) |
+| 6 | Packs | each HF pack repo holds the shards, `ngram_table.bin` and its model card | card numbers match `docs/quality-kld.md` |
+| 7 | Cross-engine (only before a public claim) | start each engine yourself, `./tests/bench.sh --url <host:port> -m <id> --full` | recorded in `~/.sushi/runs/bench-<tag>/`, engine named beside every win |
 
 **Rules:**
-- **Steps 3 and 11 are different questions.** 3 = "did our code regress", sushi only, every release. 11 = the public
+- **Steps 2 and 7 are different questions.** 2 = "did our code regress", sushi only, every release. 7 = the public
   comparison; re-run it only when another engine's version bumps.
-- **The perf gate is Sushi-4bpw alone** (`tests/bench.sh` TARGETS). A cell that lost its mode suffix means MTP stopped
-  engaging: chase it before shipping. For a regression claim on a spec cell, sample across runs and boot orders.
+- **The perf gate is Sushi-4bpw alone.** A cell that lost its mode suffix means MTP stopped engaging: chase it before
+  shipping. A low cell gets one rerun on a quiet box before anyone bisects.
 - **`--full`** takes median-of-3 per rung and climbs to 32k/64k; the default is one run per rung to 16k.
 - **Never quote a win without naming the engine it is over.**
-- **`benchmarks.md` gets one new column per release**, from the rows step 3 prints. Obey its header rules: tables
+- **`benchmarks.md` gets one new column per release**, from the rows step 2 prints. Obey its header rules: tables
   only, M5 Max only.
 
 ## Release artifacts
@@ -59,6 +55,9 @@ workflow signs with a Developer ID and notarizes only when the `APPLE_*` repo se
 1. Set `build.zig.zon`'s `.version` to the next version and rename the top `## Unreleased` entry to
    `## v<version> — Headline` (check `gh release list --limit 1` first — never reuse an existing tag)
 2. Dont commit or push
+3. After the owner (or `./release.sh`) cuts it, the Release workflow leaves a DRAFT. Publishing it fires
+   `.github/workflows/homebrew.yml`, which runs the tap's bump and fails unless `Formula/sushi.rb` names the new
+   tag (needs the `HOMEBREW_TAP_TOKEN` secret). Confirm with `brew update && brew info beamivalice/tap/sushi`.
 
 ### CHANGELOG style
 

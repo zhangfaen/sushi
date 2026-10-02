@@ -91,7 +91,7 @@ pub const SSM_DISK_MAX_PER_ENTRY: usize = 16;
 /// The cap every arch outside the long-context gate keeps.
 pub const SSM_DISK_MAX_PER_ENTRY_LEGACY: usize = 8;
 
-/// Ring restore points one entry keeps on disk (~16 MiB each on MiMo at kv8); the highest survive.
+/// Ring restore points one entry keeps on disk (~16 MiB each on MiMo at kv8), thinned (`thinRingPositions`).
 pub const RING_DISK_MAX_PER_ENTRY: usize = 8;
 
 /// SSD-first per-flush readback bound: only the device->host copy on the inference thread; the file write is off thread.
@@ -2747,8 +2747,8 @@ pub const DiskTier = struct {
         return null;
     }
 
-    /// The positions an entry holding `old` keeps after a commit offering `srcs`: the highest
-    /// `RING_DISK_MAX_PER_ENTRY`, ascending. Caller frees.
+    /// The positions an entry holding `old` keeps after a commit offering `srcs`, ascending
+    /// (`thinRingPositions`). Caller frees.
     fn ringTargetPositions(self: *DiskTier, old: []const RingFile, srcs: []const RingSource) ![]u32 {
         var set = std.ArrayList(u32).empty;
         defer set.deinit(self.allocator);
@@ -2757,7 +2757,18 @@ pub const DiskTier = struct {
             if (std.mem.indexOfScalar(u32, set.items, src.pos) == null) try set.append(self.allocator, src.pos);
         }
         std.mem.sort(u32, set.items, {}, std.sort.asc(u32));
-        return self.allocator.dupe(u32, set.items[set.items.len -| RING_DISK_MAX_PER_ENTRY..]);
+        return self.allocator.dupe(u32, thinRingPositions(set.items));
+    }
+
+    /// Thin ascending `positions` in place to `RING_DISK_MAX_PER_ENTRY` the way the RAM entry
+    /// thins its ring checkpoints: the lowest (a shared preamble) and the newest stay.
+    fn thinRingPositions(positions: []u32) []u32 {
+        var n = positions.len;
+        while (n > RING_DISK_MAX_PER_ENTRY) : (n -= 1) {
+            const k = transformer_mod.positionDropIndex(positions[0..n], .min_span_recency);
+            for (k..n - 1) |i| positions[i] = positions[i + 1];
+        }
+        return positions[0..n];
     }
 
     /// Would `srcs` add or drop a ring file of `e`? False on alloc failure (a harmless no-op).
@@ -3720,10 +3731,33 @@ pub fn modelFingerprint(allocator: std.mem.Allocator, io: std.Io, model_dir: []c
     return std.fmt.allocPrint(allocator, "{x:0>16}", .{h.final()});
 }
 
-/// Default persistence root: `~/.sushi/kv-cache`.
+/// Persistence root; an explicit directory also isolates live cache tests.
 pub fn defaultBaseDir(allocator: std.mem.Allocator) ![]u8 {
-    const home = std.mem.span(std.c.getenv("HOME") orelse return error.NoHome);
-    return std.fmt.allocPrint(allocator, "{s}/.sushi/kv-cache", .{home});
+    return cacheBaseDir(allocator,
+        if (std.c.getenv("HOME")) |h| std.mem.span(h) else null,
+        if (std.c.getenv("SUSHI_PREFIX_CACHE_DIR")) |p| std.mem.span(p) else null);
+}
+
+fn cacheBaseDir(allocator: std.mem.Allocator, home: ?[]const u8, override: ?[]const u8) ![]u8 {
+    if (override) |path| {
+        if (path.len > 0) {
+            if (!std.fs.path.isAbsolute(path)) return error.InvalidCacheDirectory;
+            return allocator.dupe(u8, path);
+        }
+    }
+    return std.fmt.allocPrint(allocator, "{s}/.sushi/kv-cache", .{home orelse return error.NoHome});
+}
+
+test "prefix cache root: explicit absolute directory and default home path" {
+    const a = std.testing.allocator;
+    const explicit = try cacheBaseDir(a, null, "/tmp/sushi-cache-test");
+    defer a.free(explicit);
+    try std.testing.expectEqualStrings("/tmp/sushi-cache-test", explicit);
+    const fallback = try cacheBaseDir(a, "/tmp/sushi-test-user", "");
+    defer a.free(fallback);
+    try std.testing.expectEqualStrings("/tmp/sushi-test-user/.sushi/kv-cache", fallback);
+    try std.testing.expectError(error.InvalidCacheDirectory, cacheBaseDir(a, null, "relative"));
+    try std.testing.expectError(error.NoHome, cacheBaseDir(a, null, null));
 }
 
 // ── Small fs helpers ──
@@ -6053,6 +6087,17 @@ test "DiskTier: a raise anywhere in appendCommit frees its owned results exactly
         tier.invalidateAll();
     }
     try testing.expect(k > 1);
+}
+
+test "DiskTier: an entry's ring files thin as its RAM checkpoints do: the lowest and the newest stay" {
+    var positions = [_]u32{ 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000 };
+    const kept = DiskTier.thinRingPositions(&positions);
+    try std.testing.expectEqual(RING_DISK_MAX_PER_ENTRY, kept.len);
+    try std.testing.expectEqual(@as(u32, 100), kept[0]);
+    try std.testing.expectEqual(@as(u32, 900), kept[kept.len - 2]);
+    try std.testing.expectEqual(@as(u32, 1000), kept[kept.len - 1]);
+    var few = [_]u32{ 100, 1000 };
+    try std.testing.expectEqualSlices(u32, &.{ 100, 1000 }, DiskTier.thinRingPositions(&few));
 }
 
 test "DiskTier: MTP head QSA half round-trips a ring plus logical rows" {

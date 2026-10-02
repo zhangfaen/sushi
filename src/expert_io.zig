@@ -910,6 +910,8 @@ fn dataPointerOf(array: mlx.mlx_array, dtype: mlx.mlx_dtype) ?*const anyopaque {
     return switch (dtype) {
         .bfloat16 => @ptrCast(mlx.mlx_array_data_bfloat16(array)),
         .uint8 => @ptrCast(mlx.mlx_array_data_uint8(array)),
+        .uint16 => @ptrCast(mlx.mlx_array_data_uint16(array)),
+        .float16 => @ptrCast(mlx.mlx_array_data_float16(array)),
         .uint32 => @ptrCast(mlx.mlx_array_data_uint32(array)),
         .float32 => @ptrCast(mlx.mlx_array_data_float32(array)),
         else => null,
@@ -1224,13 +1226,13 @@ test "expert io file cache reopens a replaced shard and reuses a stable one" {
     try t.expectEqualSlices(u8, replacement, &got);
 }
 
-pub const Dtype = enum { bf16, u8, u32, other };
+pub const Dtype = enum { bf16, f16, u8, u16, u32, other };
 
 pub const TensorRegion = struct {
     data_offset: u64,
     tensor_offset: u64,
     tensor_bytes: u64,
-    shape: [3]u64,
+    shape: [4]u64,
     rank: u8,
     dtype: Dtype,
 };
@@ -1266,6 +1268,10 @@ pub fn tensorRegion(allocator: std.mem.Allocator, fd: std.c.fd_t, key: []const u
     if (dtype != .string) return error.InvalidSafetensorsTensor;
     const dt: Dtype = if (std.mem.eql(u8, dtype.string, "BF16"))
         .bf16
+    else if (std.mem.eql(u8, dtype.string, "F16"))
+        .f16
+    else if (std.mem.eql(u8, dtype.string, "U16"))
+        .u16
     else if (std.mem.eql(u8, dtype.string, "U8") or std.mem.eql(u8, dtype.string, "UINT8"))
         .u8
     else if (std.mem.eql(u8, dtype.string, "U32") or std.mem.eql(u8, dtype.string, "UINT32"))
@@ -1273,8 +1279,8 @@ pub fn tensorRegion(allocator: std.mem.Allocator, fd: std.c.fd_t, key: []const u
     else
         .other;
     const shape = object.get("shape") orelse return error.InvalidSafetensorsTensor;
-    if (shape != .array or shape.array.items.len < 2 or shape.array.items.len > 3) return error.InvalidSafetensorsTensor;
-    var dimensions: [3]u64 = .{ 0, 0, 0 };
+    if (shape != .array or shape.array.items.len < 2 or shape.array.items.len > 4) return error.InvalidSafetensorsTensor;
+    var dimensions: [4]u64 = .{ 0, 0, 0, 0 };
     var elements: u64 = 1;
     for (shape.array.items, 0..) |dim, i| {
         if (dim != .integer or dim.integer <= 0) return error.InvalidSafetensorsTensor;

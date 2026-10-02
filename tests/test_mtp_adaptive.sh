@@ -20,7 +20,8 @@ BIN="${SUSHI_BIN:-./zig-out/bin/sushi}"
 LOG_A=/tmp/mtp_adaptive_on.log
 LOG_B=/tmp/mtp_adaptive_off.log
 WORK=$(mktemp -d /tmp/mtp_adaptive.XXXXXX)
-trap 'rm -rf "$WORK"' EXIT
+SERVER_PID=""
+trap 'rm -rf "$WORK"; [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null' EXIT
 
 # First existing candidate wins; MTP_ADAPTIVE_MODEL overrides.
 MODEL="${MTP_ADAPTIVE_MODEL:-}"
@@ -112,13 +113,16 @@ PY
 ISO_HOME="$WORK/home"
 RC_DIR="$ISO_HOME/.sushi/round-cost"
 
+require_free_port() {
+    if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+        echo "port $PORT is already in use; stop that server or pass another port" >&2
+        exit 1
+    fi
+}
+
 start_server() { # $1 = log path, $2 = value for SUSHI_MTP_ADAPTIVE_SERIAL ("" = unset)
     local log="$1" adapt="$2"
-    pkill -f "sushi.*--port $PORT" 2>/dev/null
-    for _ in $(seq 1 30); do
-        lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1 || break
-        sleep 1
-    done
+    require_free_port
     : > "$log"
     # Never read or write the user's round-cost table; the boots must stay independent.
     if [ -n "$adapt" ]; then
@@ -336,11 +340,7 @@ echo "== boot C: --no-mtp, persistence ON, isolated HOME =="
 LOG_C=/tmp/mtp_adaptive_nomtp.log
 mkdir -p "$ISO_HOME"
 rm -rf "$RC_DIR"
-pkill -f "sushi.*--port $PORT" 2>/dev/null
-for _ in $(seq 1 30); do
-    lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1 || break
-    sleep 1
-done
+require_free_port
 : > "$LOG_C"
 HOME="$ISO_HOME" SUSHI_MTP_TRACE=1 SUSHI_ROUND_COST_PERSIST=1 \
 "$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" \

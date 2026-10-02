@@ -77,8 +77,10 @@ echo "  model: $MODEL"
 echo "  max_tokens: $MAX_TOKENS, parallel: $N_PARALLEL, threshold: ${SPEEDUP_THRESHOLD}× speedup"
 echo
 
-pkill -f "sushi.*--port $PORT" 2>/dev/null || true
-sleep 1
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    exit 1
+fi
 
 LOGFILE=$(mktemp)
 "$BINARY" --model "$MODEL" --serve --port "$PORT" --max-concurrent "$N_PARALLEL" --no-pld > "$LOGFILE" 2>&1 &

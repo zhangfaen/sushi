@@ -11,8 +11,8 @@
 #      its own server lifecycle and appends audit_format leak markers.
 #
 # One model loaded at a time; missing weights skip cleanly. Both models are
-# too large to coexist — this script pkills ALL serving sushi instances
-# up front.
+# too large to coexist — this script refuses to start while any sushi runs,
+# and stops only the servers it started.
 #
 # Usage:
 #   ./tests/test_validator_matrix.sh                      # full matrix
@@ -39,11 +39,10 @@ mkdir -p "$RESULTS"
 GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
 
 # logical|display|path|pi_case|probe_timeout_s|extra server flags
-# pi_case must exist in pi_integration_run.sh's html matrix; empty = no pi
-# layer (pi's driver boots without the streaming budget MiMo needs).
+# pi_case must exist in pi_integration_run.sh's html matrix; empty = no pi layer.
 MODELS=(
     "qwen4_exp|Qwen3.8 Flash-Next (qwen4_exp)|${QWEN4_EXP_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}|html-qwen4|240|"
-    "mimo_v2|MiMo-V2.6-Flash EXL3 (mimo_v2)|${MIMO_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.5bpw}||240|--no-vision"
+    "mimo_v2|MiMo-V2.6-Flash EXL3 (mimo_v2)|${MIMO_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.3bpw}|html-mimo|240|--no-vision"
 )
 
 if [[ -n "${VALIDATOR_MODELS:-}" ]]; then
@@ -67,15 +66,20 @@ if [[ -z "${SKIP_PROBE:-}" && ! -f "$LLMPROBE_MJS" ]]; then
     exit 1
 fi
 
-kill_servers() {
-    pkill -f 'sushi.*--serve' 2>/dev/null || true
-    for _ in $(seq 1 10); do
-        pgrep -f 'sushi.*--serve' >/dev/null || return 0
-        sleep 0.5
-    done
+SERVER_PID=""
+stop_server() {
+    [[ -n "$SERVER_PID" ]] || return 0
+    kill "$SERVER_PID" 2>/dev/null
+    wait "$SERVER_PID" 2>/dev/null
+    SERVER_PID=""
 }
 
 start_server() { # path logfile extra-flags -> 0 on healthy
+    # A previous row's server still on the port would be scored as this row's.
+    if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+        echo "port $PORT is still in use; not booting this row" >&2
+        return 1
+    fi
     # shellcheck disable=SC2086 # $3 is a flag list
     "$BINARY" --model "$1" --serve --port "$PORT" --log-level info \
         --ctx-size 32768 $3 > "$2" 2>&1 &
@@ -90,8 +94,16 @@ start_server() { # path logfile extra-flags -> 0 on healthy
 
 strip_ansi() { sed -E $'s/\x1b\\[[0-9;]*m//g'; }
 
-trap 'kill_servers' EXIT
-kill_servers
+trap 'stop_server' EXIT
+running=$(pgrep -x sushi | paste -sd' ' -)
+if [[ -n "$running" ]]; then
+    echo "sushi is already running (pid $running); stop it first, the models cannot coexist with it" >&2
+    exit 1
+fi
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or set PORT" >&2
+    exit 1
+fi
 
 [[ -f "$SUMMARY" ]] || printf "timestamp\tmodel\tprobe\tpi\tnotes\n" > "$SUMMARY"
 
@@ -135,7 +147,7 @@ for entry in "${MODELS[@]}"; do
             echo -e "${RED}server failed to boot — tail of $server_log:${NC}"
             tail -n 20 "$server_log"
         fi
-        kill_servers
+        stop_server
     fi
 
     # ---- Layer 2: pi agentic 2-turn html case (multi-turn tool calls) ------

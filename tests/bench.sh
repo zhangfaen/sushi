@@ -5,7 +5,7 @@
 # medians AND the context ladder. The numbers go into benchmarks.md by hand —
 # there is no CSV, no chart pipeline and no engine matrix here any more.
 #
-#   ./tests/bench.sh                                # the perf gate (Sushi-4bpw)
+#   ./tests/bench.sh                                # the perf gate (Sushi-4bpw), then MiMo
 #   ./tests/bench.sh --only sushi-4bpw              # one row
 #   ./tests/bench.sh --url 127.0.0.1:1234 -m <id>   # a server someone else started
 #   ./tests/bench.sh --full                         # median of 3 per rung, to 64k
@@ -65,6 +65,7 @@ MD="${SUSHI_MODELS_DIR:-$HOME/.sushi/models}"
 # ane-on cells are their own column, never diffed against ane-off ones.
 TARGETS=(
     "sushi-4bpw|$MD/Qwen3.8-Flash-Next-Sushi-4bpw"
+    "mimo-2.3bpw|$MD/MiMo-V2.6-Flash-Sushi-2.3bpw"
 )
 
 # Only ever called on the path that STARTED a server: --url may be pointed at

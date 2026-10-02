@@ -20,9 +20,12 @@ BINARY="${BINARY:-./zig-out/bin/sushi}"
 [[ -d "$MODEL" ]] || { echo "SKIP: model dir not found: $MODEL"; exit 0; }
 [[ -x "$BINARY" ]] || { echo "SKIP: $BINARY missing"; exit 0; }
 
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    exit 1
+fi
 WORK=$(mktemp -d "$HOME/.sushi/runs/batched-feat.XXXXXX" 2>/dev/null || mktemp -d)
 mkdir -p "$WORK/home"
-pkill -f "sushi.*--port $PORT" 2>/dev/null; sleep 0.5
 HOME="$WORK/home" "$BINARY" --serve --host 127.0.0.1 --port "$PORT" --model "$MODEL" \
     --log-level debug --max-concurrent 8 --prefix-cache-entries 0 > "$WORK/server.log" 2>&1 &
 SERVER_PID=$!

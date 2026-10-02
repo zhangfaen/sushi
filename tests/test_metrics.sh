@@ -42,8 +42,10 @@ if [ ! -d "$MODEL" ]; then
     exit 0
 fi
 
-pkill -f "sushi.*--port $PORT" 2>/dev/null || true
-sleep 1
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    exit 1
+fi
 
 wait_health() {
     for _ in $(seq 1 90); do
@@ -75,7 +77,7 @@ STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/metrics.json")
 check "GET /metrics.json without --metrics → 503" "$([ "$STATUS" = "503" ] && echo 1 || echo 0)"
 
 kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true
-pkill -f "sushi.*--port $PORT" 2>/dev/null || true; sleep 1
+sleep 1
 
 # ════════════════════════════════════════════════════════════════════════════
 # Phase 2: With --metrics, both endpoints answer

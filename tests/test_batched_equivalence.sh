@@ -213,8 +213,10 @@ echo "== batched-kernel byte-equivalence test =="
 echo "  model: $MODEL"
 echo
 
-pkill -f "sushi.*--port $PORT" 2>/dev/null || true
-sleep 1
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    exit 1
+fi
 
 OUT_SINGLE=$(run_request "single-slot path (default)" "0") || exit 1
 echo "  single-slot output captured ($(echo "$OUT_SINGLE" | wc -c) bytes)"

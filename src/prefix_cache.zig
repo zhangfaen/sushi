@@ -49,9 +49,23 @@ pub const MIN_CANCELLED_COMMIT_TOKENS: usize = 256;
 /// Shortest prefix a ring-checkpoint restore reuses; below it the request cold-prefills.
 pub const RING_RESTORE_MIN_TOKENS: usize = 64;
 
-/// Ring checkpoints one entry keeps; the highest survive, since a later request forks near the
-/// end of the conversation. One is ~16 MiB on MiMo at kv8.
-pub const RING_CHECKPOINT_MAX: usize = 4;
+/// Ring checkpoints one entry keeps, thinned so the lowest (a shared preamble) and the newest
+/// (where the conversation goes on) stay (`thinRingCps`). One is ~16 MiB on MiMo at kv8.
+pub const RING_CHECKPOINT_MAX: usize = 8;
+
+/// Message starts one prefill takes a ring checkpoint at (`ringMarkPositions`).
+pub const RING_MARKS_MAX: usize = 4;
+
+/// The special token that opens a message in the served chat templates: where the marks sit.
+pub const RING_MARK_TOKEN = "<|im_start|>";
+
+/// Ring checkpoints one slot holds at once: its restore, its marks and its prompt end
+/// (`server.slotRingBytes` bills them).
+pub const SLOT_RING_CHECKPOINTS: usize = 2 + RING_MARKS_MAX;
+
+comptime {
+    std.debug.assert(SLOT_RING_CHECKPOINTS <= RING_CHECKPOINT_MAX);
+}
 
 /// Why a lookup that found a real raw token match still restored nothing.
 /// `findBestRestorableMatch` `continue`s every candidate whose highest SSM
@@ -106,6 +120,8 @@ pub const CommitStatus = union(enum) {
     /// Entry committed (inserted or replaced) at this many tokens — the
     /// post-trim EFFECTIVE length, never the candidate's forwarded length.
     ok: usize,
+    /// Full state captured for the SSD tier; no idle RAM entry retained.
+    disk_only: usize,
     /// The budget decline kept a resident entry that already covers this
     /// many tokens; the longer candidate was discarded (details logged).
     kept_resident: usize,
@@ -139,14 +155,94 @@ pub const LookupResult = struct {
     /// Did this restore check out its entry (`checkoutEligible`)? Only then does the first
     /// append donate in place; every other restore is a refcount share copied by that append.
     checked_out: bool = false,
+    /// Did an SSD restore fill buffers the slot owns outright (`restoreKvInto`)?
+    slot_owned: bool = false,
     /// `Entry.id` of the RAM entry restored from; 0 = none.
     entry_id: u64 = 0,
+
+    /// Are the restored rows the slot's own? Only those the admission bill credits (`WarmPrefix.will_donate`).
+    pub fn ownsRestoredRows(self: LookupResult) bool {
+        return self.checked_out or self.slot_owned;
+    }
 };
 
 /// A ringed slot's restore points (`KVCache.ringCheckpoint`), handed to the commit that owns
 /// them from then on: where the request restored to, taken before its tail was forwarded (the
-/// fork off another entry, which may be evicted before this commit), and its prompt end.
-pub const SlotRingCps = struct { fork: ?KVCacheSnapshot = null, prompt_end: ?KVCacheSnapshot = null };
+/// fork off another entry, which may be evicted before this commit), the message starts its
+/// prefill crossed (`marks`, filled by the forward through `KVCache.ring_marks`), and its prompt end.
+pub const SlotRingCps = struct {
+    fork: ?KVCacheSnapshot = null,
+    prompt_end: ?KVCacheSnapshot = null,
+    marks: [RING_MARKS_MAX]KVCacheSnapshot = undefined,
+    n_marks: usize = 0,
+
+    pub fn deinit(self: *SlotRingCps) void {
+        if (self.fork) |*r| r.deinit();
+        if (self.prompt_end) |*r| r.deinit();
+        self.dropMarks();
+        self.* = .{};
+    }
+
+    fn dropMarks(self: *SlotRingCps) void {
+        for (self.marks[0..self.n_marks]) |*m| m.deinit();
+        self.n_marks = 0;
+    }
+
+    /// Empty marks at `positions` for the prefill to fill, replacing any left from an earlier
+    /// attempt. Best effort: an allocation failure keeps the ones made so far.
+    pub fn armMarks(self: *SlotRingCps, cache: *const KVCache, positions: []const usize) void {
+        self.dropMarks();
+        for (positions[0..@min(positions.len, RING_MARKS_MAX)]) |p| {
+            self.marks[self.n_marks] = cache.ringMark(p) catch return;
+            self.n_marks += 1;
+        }
+    }
+
+    pub fn markSlice(self: *SlotRingCps) []KVCacheSnapshot {
+        return self.marks[0..self.n_marks];
+    }
+
+    /// Free the marks the prefill did not fill on every ringed layer; only a whole one restores.
+    pub fn keepCompleteMarks(self: *SlotRingCps, cache: *const KVCache) void {
+        var kept: usize = 0;
+        for (self.marks[0..self.n_marks]) |*m| {
+            if (cache.ringMarkComplete(m)) {
+                self.marks[kept] = m.*;
+                kept += 1;
+            } else m.deinit();
+        }
+        self.n_marks = kept;
+    }
+
+    pub fn bytes(self: *const SlotRingCps) u64 {
+        var total: u64 = 0;
+        if (self.fork) |*c| total += transformer_mod.kvEntriesBytes(c.entries);
+        if (self.prompt_end) |*c| total += transformer_mod.kvEntriesBytes(c.entries);
+        for (self.marks[0..self.n_marks]) |*c| total += transformer_mod.kvEntriesBytes(c.entries);
+        return total;
+    }
+};
+
+/// Where a prefill takes ring checkpoints: the message starts (`mark_id`) it forwards past the
+/// `restored` prefix, from the restore floor up to where the prompt-end checkpoint reaches;
+/// thinned to `RING_MARKS_MAX` keeping the first (a shared preamble's end) and the last.
+pub fn ringMarkPositions(prompt: []const u32, restored: usize, mark_id: u32, out: *[RING_MARKS_MAX]usize) []usize {
+    var buf: [RING_MARKS_MAX + 1]usize = undefined;
+    var n: usize = 0;
+    var p = @max(restored + 1, RING_RESTORE_MIN_TOKENS);
+    while (p + model_mod.ModelConfig.SWA_RING_CHECKPOINT_BACKOFF < prompt.len) : (p += 1) {
+        if (prompt[p] != mark_id) continue;
+        buf[n] = p;
+        n += 1;
+        if (n > RING_MARKS_MAX) {
+            const k = transformer_mod.positionDropIndexUsize(buf[0..n], .min_span);
+            for (k..n - 1) |i| buf[i] = buf[i + 1];
+            n -= 1;
+        }
+    }
+    @memcpy(out[0..n], buf[0..n]);
+    return out[0..n];
+}
 
 /// One media block of a prompt: where its placeholder rows start, and a key
 /// over that block and every block before it (pixels and positions).
@@ -325,8 +421,8 @@ pub fn restoreMoveEnabled() bool {
 /// The SSD-first predicate: arch, env switch, AND a disk tier. Without the tier the mode used
 /// to arm with nowhere to spill and a budget floor sized for a tier that did not exist. The
 /// budget resolver asks `--prefix-cache-disk > 0`, the arming asks `disk != null`.
-pub fn ssdFirstActive(config: *const model_mod.ModelConfig, has_disk: bool) bool {
-    return has_disk and config.ssdFirstCapable() and ssdFirstEnabled();
+pub fn ssdFirstActive(config: *const model_mod.ModelConfig, has_disk: bool, ram_enabled: bool) bool {
+    return has_disk and ssdFirstEnabled() and (config.ssdFirstCapable() or !ram_enabled);
 }
 
 /// What the live cache held at commit time, captured before the RAM byte-budget trim: the
@@ -336,6 +432,7 @@ const PendingDiskFlush = struct {
     tokens: []u32,
     has_tools: bool,
     ssm_cps: ?[]SSMCheckpoint = null,
+    ring_cps: ?[]KVCacheSnapshot = null,
     dflash: ?DflashSnap = null,
     mtp: ?DflashSnap = null,
 
@@ -346,6 +443,7 @@ const PendingDiskFlush = struct {
             for (cps) |*cp| cp.deinit(allocator);
             allocator.free(cps);
         }
+        if (self.ring_cps) |cps| HotPrefixCache.freeRingCps(allocator, cps);
         if (self.dflash) |*d| d.deinit();
         if (self.mtp) |*m| m.deinit();
     }
@@ -450,6 +548,9 @@ pub const HotPrefixCache = struct {
     /// Checkpoint-retention policy, mirrored once at wiring from `ModelConfig.longCtxGated()`
     /// (this struct never sees a ModelConfig). The default is the previous behaviour.
     cp_thin: transformer_mod.ThinPolicy = .min_span,
+    /// Whether completed requests retain reusable KV in RAM. The live slot still owns its
+    /// working KV; false keeps reusable prefixes only on the SSD tier.
+    ram_enabled: bool = true,
     /// SSD-first mode; set by the scheduler at load.
     ssd_first: bool = false,
     /// SSD-first: the RAM allowance for idle entries (the resolved `--prefix-cache-mem`).
@@ -467,7 +568,8 @@ pub const HotPrefixCache = struct {
     pub fn initWithMem(allocator: std.mem.Allocator, max_entries: u32, max_kv_bytes: u64) HotPrefixCache {
         return .{
             .entries = std.ArrayList(Entry).empty,
-            .max_entries = if (max_entries == 0) 1 else max_entries,
+            .max_entries = max_entries,
+            .ram_enabled = max_entries > 0,
             .max_kv_bytes = max_kv_bytes,
             .current_kv_bytes = 0,
             .allocator = allocator,
@@ -1324,6 +1426,7 @@ pub const HotPrefixCache = struct {
                     // length, `hm` by restorable checkpoint, so they routinely differ.
                     .dflash_base = diskRestoreSpec(d, hm.idx, dflash_target, restored, s, .dflash),
                     .mtp_base = disk_mtp,
+                    .slot_owned = true,
                 };
             }
 
@@ -1427,6 +1530,7 @@ pub const HotPrefixCache = struct {
             if (target_ssm_entries) |entries| resetSsmEntries(entries);
             target_moe_seq_offset.* = 0;
             self.last_restored_used = null;
+            e.last_used = used_before_restore;
         }
         try target_cache.restore(&e.snapshot);
 
@@ -1498,9 +1602,9 @@ pub const HotPrefixCache = struct {
             try target_cache.truncate(0, s);
             // A 0-token outcome is not a restore: the marker was set above the restore (the hybrid
             // clamp needs the entry live) and would otherwise shield a fully reclaimable entry from
-            // the admission pass. The LRU hand-back takes the same `ssd_first` gate as the lien decline.
+            // the admission pass. Promoted, the entry would make a usable one the next eviction victim.
             self.last_restored_used = null;
-            if (self.ssd_first) e.last_used = used_before_restore;
+            e.last_used = used_before_restore;
             log.info("  [hot-cache] hybrid miss (no checkpoint ≤ {d} of {d}); cold prefill\n", .{ m.shared, prompt_ids.len });
             return .{ .matched = 0, .full_match = false };
         }
@@ -1530,6 +1634,8 @@ pub const HotPrefixCache = struct {
             if (target_ssm_entries) |entries| resetSsmEntries(entries);
             target_moe_seq_offset.* = 0;
             self.last_restored_used = null;
+            // Nothing was restored: promoted, this entry made a usable one the next eviction victim.
+            e.last_used = used_before_restore;
             return .{ .matched = 0, .full_match = false };
         };
 
@@ -1748,7 +1854,7 @@ pub const HotPrefixCache = struct {
 
         // Record what the live cache holds now, before any byte-budget trim.
         if (self.ssd_first and self.disk != null and vision_key == 0) {
-            self.capturePendingDisk(source_cache, tokens, has_tools, ssm_cps, dflash, mtp);
+            self.capturePendingDisk(source_cache, tokens, has_tools, ssm_cps, dflash, mtp, new_rings);
         }
         // The record shares the live KV; on an error return nothing consumes it and the slot's
         // KVCache deinit then frees nothing. Function scope on purpose.
@@ -1756,6 +1862,16 @@ pub const HotPrefixCache = struct {
             p.deinit(self.allocator);
             self.pending_disk = null;
         };
+
+        if (!self.ram_enabled) {
+            if (ssm_cps) |cps| {
+                for (cps) |*cp| cp.deinit(self.allocator);
+                self.allocator.free(cps);
+            }
+            if (self.pending_disk == null) return .declined;
+            self.disk_dirty = true;
+            return .{ .disk_only = tokens.len };
+        }
 
         // An entry's pixel key applies only to rows it actually covers. When
         // the committed range ends before the request's first media row — a
@@ -2349,6 +2465,7 @@ pub const HotPrefixCache = struct {
         ssm_cps: ?[]SSMCheckpoint,
         dflash: ?DflashCommit,
         mtp: ?DflashCommit,
+        ring_cps: ?[]const KVCacheSnapshot,
     ) void {
         if (self.pending_disk) |*old| {
             old.deinit(self.allocator);
@@ -2366,6 +2483,7 @@ pub const HotPrefixCache = struct {
             },
             .has_tools = has_tools,
         };
+        if (ring_cps) |cps| rec.ring_cps = shareRingCpsUpTo(self.allocator, cps, std.math.maxInt(usize), null) catch null;
         if (ssm_cps) |cps| {
             rec.ssm_cps = cloneCheckpointsUpTo(self.allocator, cps, std.math.maxInt(usize), null) catch null;
         }
@@ -2574,7 +2692,7 @@ pub const HotPrefixCache = struct {
                 .head_pos_base = mm.head_pos_base,
                 .head_marks = mm.head_marks.slice(),
             } else null;
-            const ok = d.appendCommitWithSpec(
+            const ok = d.appendCommitWithRing(
                 pending.snapshot.entries,
                 pending.snapshot.step,
                 pending.snapshot.config,
@@ -2583,6 +2701,7 @@ pub const HotPrefixCache = struct {
                 pending.ssm_cps,
                 p_dflash,
                 p_mtp,
+                ringCommitOf(&pending.snapshot, pending.ring_cps),
                 s,
             ) catch |err| {
                 log.warn("  [disk-cache] persist failed: {s}\n", .{@errorName(err)});
@@ -2827,38 +2946,62 @@ pub const HotPrefixCache = struct {
     }
 
     /// Refcount-share `src`'s ring checkpoints with `step <= limit` into an ascending slice the
-    /// caller owns, highest first while `budget` (null = unbounded) lasts. Null when none
-    /// qualifies. Billed again per entry, as `cloneCheckpointsUpTo` explains.
+    /// caller owns, thinned to `RING_CHECKPOINT_MAX` and to `budget` (null = unbounded). Null
+    /// when none qualifies. Billed again per entry, as `cloneCheckpointsUpTo` explains.
     fn shareRingCpsUpTo(allocator: std.mem.Allocator, src: []const KVCacheSnapshot, limit: usize, budget: ?u64) !?[]KVCacheSnapshot {
-        var out = std.ArrayList(KVCacheSnapshot).empty;
-        errdefer {
-            for (out.items) |*c| c.deinit();
-            out.deinit(allocator);
-        }
-        var spent: u64 = 0;
-        var k = src.len;
-        while (k > 0 and out.items.len < RING_CHECKPOINT_MAX) {
-            k -= 1;
-            const cp = &src[k];
-            if (cp.step > limit) continue;
-            const cost = snapshotBytes(cp);
-            if (budget) |b| {
-                if (spent + cost > b) break;
+        var n: usize = 0;
+        for (src) |*cp| n += @intFromBool(cp.step <= limit);
+        if (n == 0) return null;
+        const out = try allocator.alloc(KVCacheSnapshot, n);
+        var total: u64 = 0;
+        {
+            var filled: usize = 0;
+            errdefer {
+                for (out[0..filled]) |*c| c.deinit();
+                allocator.free(out);
             }
-            spent += cost;
-            try out.ensureUnusedCapacity(allocator, 1);
-            out.appendAssumeCapacity(try cp.share());
+            for (src) |*cp| {
+                if (cp.step > limit) continue;
+                out[filled] = try cp.share();
+                total += snapshotBytes(cp);
+                filled += 1;
+            }
         }
-        if (out.items.len == 0) {
-            out.deinit(allocator);
-            return null;
-        }
-        std.mem.reverse(KVCacheSnapshot, out.items);
-        return try out.toOwnedSlice(allocator);
+        return thinRingCps(allocator, out, RING_CHECKPOINT_MAX, if (budget) |b| total -| b else 0);
     }
 
-    /// One ascending list from two owned ones (a tie keeps `new`'s), cut to the highest
-    /// `RING_CHECKPOINT_MAX`. Consumes both on every path.
+    fn ringStepOf(cp: *const KVCacheSnapshot) usize {
+        return cp.step;
+    }
+
+    /// Thin an owned ascending list to `max_len` checkpoints and by at least `need_free` bytes,
+    /// dropping where coverage loses least: the lowest (a shared preamble) and the newest stay
+    /// longest. Consumes `cps` on every path; null when none survives.
+    fn thinRingCps(allocator: std.mem.Allocator, cps: []KVCacheSnapshot, max_len: usize, need_free: u64) !?[]KVCacheSnapshot {
+        errdefer freeRingCps(allocator, cps);
+        var live = try std.ArrayList(KVCacheSnapshot).initCapacity(allocator, cps.len);
+        defer live.deinit(allocator);
+        live.appendSliceAssumeCapacity(cps);
+        var freed: u64 = 0;
+        while (live.items.len > 0 and (live.items.len > max_len or freed < need_free)) {
+            const k = transformer_mod.spanPreservingDropIndex(KVCacheSnapshot, live.items, ringStepOf, .min_span_recency, null);
+            freed += snapshotBytes(&live.items[k]);
+            _ = live.orderedRemove(k);
+        }
+        if (live.items.len == cps.len) return cps;
+        const kept: ?[]KVCacheSnapshot = if (live.items.len == 0) null else try allocator.dupe(KVCacheSnapshot, live.items);
+        for (cps) |*c| {
+            const survives = for (live.items) |l| {
+                if (l.entries.ptr == c.entries.ptr) break true;
+            } else false;
+            if (!survives) c.deinit();
+        }
+        allocator.free(cps);
+        return kept;
+    }
+
+    /// One ascending list from two owned ones (a tie keeps `new`'s), thinned to
+    /// `RING_CHECKPOINT_MAX` (`thinRingCps`). Consumes both on every path.
     fn mergeRingCps(allocator: std.mem.Allocator, old: ?[]KVCacheSnapshot, new: ?[]KVCacheSnapshot) !?[]KVCacheSnapshot {
         var none = [_]KVCacheSnapshot{};
         const a: []KVCacheSnapshot = old orelse &none;
@@ -2867,52 +3010,72 @@ pub const HotPrefixCache = struct {
             if (old) |o| allocator.free(o);
             if (new) |n| allocator.free(n);
         }
-        var kept: [RING_CHECKPOINT_MAX]KVCacheSnapshot = undefined;
-        var n: usize = 0;
-        var i = a.len;
-        var j = b.len;
-        while (i > 0 or j > 0) {
-            const from_new = i == 0 or (j > 0 and b[j - 1].step >= a[i - 1].step);
-            var cp = if (from_new) b[j - 1] else a[i - 1];
-            if (from_new) {
-                if (i > 0 and a[i - 1].step == cp.step) {
-                    a[i - 1].deinit();
-                    i -= 1;
-                }
-                j -= 1;
-            } else i -= 1;
-            if (n < kept.len) {
-                kept[n] = cp;
-                n += 1;
-            } else cp.deinit();
+        var ties: usize = 0;
+        for (a) |x| {
+            for (b) |y| ties += @intFromBool(x.step == y.step);
         }
+        const n = a.len + b.len - ties;
         if (n == 0) return null;
         const out = allocator.alloc(KVCacheSnapshot, n) catch |err| {
-            for (kept[0..n]) |*c| c.deinit();
+            for (a) |*c| c.deinit();
+            for (b) |*c| c.deinit();
             return err;
         };
-        for (out, 0..) |*o, k| o.* = kept[n - 1 - k];
-        return out;
+        var i: usize = 0;
+        var j: usize = 0;
+        for (out) |*o| {
+            if (j == b.len or (i < a.len and a[i].step < b[j].step)) {
+                o.* = a[i];
+                i += 1;
+                continue;
+            }
+            if (i < a.len and a[i].step == b[j].step) {
+                a[i].deinit();
+                i += 1;
+            }
+            o.* = b[j];
+            j += 1;
+        }
+        return thinRingCps(allocator, out, RING_CHECKPOINT_MAX, 0);
     }
 
-    /// The slot's own checkpoints as an ascending owned list; best effort, like their capture.
+    /// The slot's own checkpoints as an ascending owned list (a tie keeps the later one, so the
+    /// prompt end beats the fork); best effort, like their capture.
     fn ownRingCps(allocator: std.mem.Allocator, cps: SlotRingCps) ?[]KVCacheSnapshot {
-        var fork = cps.fork;
-        var end = cps.prompt_end;
-        if (fork != null and end != null and fork.?.step >= end.?.step) {
-            fork.?.deinit();
-            fork = null;
+        var all: [SLOT_RING_CHECKPOINTS]KVCacheSnapshot = undefined;
+        var n: usize = 0;
+        if (cps.fork) |f| {
+            all[n] = f;
+            n += 1;
         }
-        const n = @as(usize, @intFromBool(fork != null)) + @intFromBool(end != null);
+        for (cps.marks[0..cps.n_marks]) |m| {
+            all[n] = m;
+            n += 1;
+        }
+        if (cps.prompt_end) |e| {
+            all[n] = e;
+            n += 1;
+        }
         if (n == 0) return null;
-        const out = allocator.alloc(KVCacheSnapshot, n) catch {
-            if (fork) |*f| f.deinit();
-            if (end) |*e| e.deinit();
+        std.sort.insertion(KVCacheSnapshot, all[0..n], {}, struct {
+            fn lt(_: void, x: KVCacheSnapshot, y: KVCacheSnapshot) bool {
+                return x.step < y.step;
+            }
+        }.lt);
+        var kept: usize = 0;
+        for (all[0..n]) |cp| {
+            if (kept > 0 and all[kept - 1].step == cp.step) {
+                all[kept - 1].deinit();
+                all[kept - 1] = cp;
+            } else {
+                all[kept] = cp;
+                kept += 1;
+            }
+        }
+        return allocator.dupe(KVCacheSnapshot, all[0..kept]) catch {
+            for (all[0..kept]) |*c| c.deinit();
             return null;
         };
-        if (fork) |f| out[0] = f;
-        if (end) |e| out[n - 1] = e;
-        return out;
     }
 
     /// The checkpoints at or below `limit`, as an owned list; consumes `cps`.
@@ -3040,23 +3203,20 @@ pub const HotPrefixCache = struct {
         log.info("  [hot-cache] shed {d} checkpoints to fit the byte budget ({d} kept)\n", .{ shed, n });
     }
 
-    /// Lowest first, while the cache is over its budget: a later request forks near the end.
+    /// While the cache is over its budget, the way `thinRingCps` drops them.
     fn shedRingCheckpoints(self: *HotPrefixCache, e: *Entry) void {
         const cps = e.ring_cps orelse return;
-        var drop: usize = 0;
-        var freed: u64 = 0;
-        while (drop < cps.len and self.current_kv_bytes -| freed > self.max_kv_bytes) : (drop += 1) {
-            freed += snapshotBytes(&cps[drop]);
-        }
-        if (drop == 0) return;
-        // A fresh list, never a shrunk one: a deinit'd snapshot left in the slice would be freed twice.
-        const kept: ?[]KVCacheSnapshot = if (drop == cps.len) null else self.allocator.dupe(KVCacheSnapshot, cps[drop..]) catch return;
-        for (cps[0..drop]) |*c| c.deinit();
-        self.allocator.free(cps);
-        e.ring_cps = kept;
+        const over = self.current_kv_bytes -| self.max_kv_bytes;
+        if (over == 0) return;
+        const before_n = cps.len;
+        const before = ringCpsBytes(cps);
+        e.ring_cps = null;
+        e.ring_cps = thinRingCps(self.allocator, cps, RING_CHECKPOINT_MAX, over) catch null;
+        const freed = before - ringCpsBytes(e.ring_cps);
         e.kv_bytes -|= freed;
         self.current_kv_bytes -|= freed;
-        log.info("  [hot-cache] shed {d} ring checkpoints to fit the byte budget ({d} kept)\n", .{ drop, cps.len - drop });
+        const kept = if (e.ring_cps) |r| r.len else 0;
+        log.info("  [hot-cache] shed {d} ring checkpoints to fit the byte budget ({d} kept)\n", .{ before_n - kept, kept });
     }
 
     /// Re-clamp the byte budget after the machine's residency changed (a model loaded
@@ -3428,10 +3588,11 @@ test "HotPrefixCache: shouldUse rejects deepseek_v4 (module-owned decode state)"
     try testing.expect(!HotPrefixCache.shouldUse(&cfg, true));
 }
 
-test "HotPrefixCache: init zero capacity clamps to 1" {
+test "HotPrefixCache: zero capacity disables RAM retention" {
     var cache = HotPrefixCache.init(testing.allocator, 0);
     defer cache.deinit();
-    try testing.expectEqual(@as(u32, 1), cache.max_entries);
+    try testing.expectEqual(@as(u32, 0), cache.max_entries);
+    try testing.expect(!cache.ram_enabled);
     try testing.expectEqual(@as(usize, 0), cache.entryCount());
 }
 
@@ -3955,6 +4116,41 @@ test "a ring checkpoint restore below the floor cold-prefills" {
     }
 }
 
+test "a restore declined at the ring clamp leaves its entry's recency alone" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const window: u32 = 8;
+    const n_layers: u32 = 4;
+    const prompt: u32 = 700;
+    const reply: u32 = 600;
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    // Two sessions that share only a chat header, the older one committed first.
+    for ([_]u32{ 0, 500_000 }) |offset| {
+        var toks: [prompt + reply]u32 = undefined;
+        for (&toks, 0..) |*t, i| t.* = if (i < 3) @intCast(i + 1) else @intCast(offset + i + 1);
+        var live = try KVCache.init(testing.allocator, n_layers);
+        defer live.deinit();
+        const cp = try ringTurn(&live, s, n_layers, window, prompt, reply);
+        _ = try hc.commitWithRing(&live, &toks, false, 0, 0, null, null, null, null, prompt, .{ .prompt_end = cp });
+    }
+    const before = [_]u64{ hc.entries.items[0].last_used, hc.entries.items[1].last_used };
+    try testing.expect(before[0] < before[1]);
+
+    // A request sharing only the header lands on one of them and declines at the clamp.
+    var header_only: [prompt]u32 = undefined;
+    for (&header_only, 0..) |*t, i| t.* = if (i < 3) @intCast(i + 1) else @intCast(900_000 + i);
+    var cold = try KVCache.init(testing.allocator, n_layers);
+    defer cold.deinit();
+    cold.setSwaRing(window);
+    var moe_off: usize = 0;
+    const miss = try hc.lookupAndRestore(&cold, &moe_off, null, s, &header_only, false, 0, null, null);
+    try testing.expectEqual(@as(usize, 0), miss.matched);
+    // A restore that did not happen is not a use: promoted, the older entry made the newer one the eviction victim.
+    try testing.expectEqual(before[0], hc.entries.items[0].last_used);
+    try testing.expectEqual(before[1], hc.entries.items[1].last_used);
+}
+
 test "ringed candidates rank by restorable position, not raw match" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
@@ -4007,20 +4203,196 @@ fn stubRingCps(steps: []const usize, mark: usize) ![]KVCacheSnapshot {
     return out;
 }
 
-test "ring checkpoints merge ascending, a tie keeps the newer, and only the highest RING_CHECKPOINT_MAX stay" {
+test "ring checkpoints merge ascending, a tie keeps the newer, and past RING_CHECKPOINT_MAX the interior thins: the lowest and the newest stay" {
     const merged = (try HotPrefixCache.mergeRingCps(
         testing.allocator,
-        try stubRingCps(&.{ 100, 300, 500 }, 1),
-        try stubRingCps(&.{ 300, 700, 900 }, 2),
+        try stubRingCps(&.{ 100, 300, 500, 1100, 1300, 1500 }, 1),
+        try stubRingCps(&.{ 300, 1700, 1900, 2100, 2300 }, 2),
     )).?;
     defer HotPrefixCache.freeRingCps(testing.allocator, merged);
     try testing.expectEqual(RING_CHECKPOINT_MAX, merged.len);
-    const want = [_]struct { step: usize, mark: usize }{ .{ .step = 300, .mark = 2 }, .{ .step = 500, .mark = 1 }, .{ .step = 700, .mark = 2 }, .{ .step = 900, .mark = 2 } };
-    for (merged, want) |cp, w| {
-        try testing.expectEqual(w.step, cp.step);
-        try testing.expectEqual(w.mark, cp.entries[0].offset);
+    try testing.expectEqual(@as(usize, 100), merged[0].step);
+    try testing.expectEqual(@as(usize, 2100), merged[merged.len - 2].step);
+    try testing.expectEqual(@as(usize, 2300), merged[merged.len - 1].step);
+    for (merged[0 .. merged.len - 1], merged[1..]) |a, b| try testing.expect(a.step < b.step);
+    for (merged) |cp| {
+        if (cp.step == 300) try testing.expectEqual(@as(usize, 2), cp.entries[0].offset);
+    }
+
+    const small = (try HotPrefixCache.mergeRingCps(testing.allocator, try stubRingCps(&.{ 100, 500 }, 1), try stubRingCps(&.{ 300, 500 }, 2))).?;
+    defer HotPrefixCache.freeRingCps(testing.allocator, small);
+    try testing.expectEqual(@as(usize, 3), small.len);
+    for (small, [_]usize{ 100, 300, 500 }, [_]usize{ 1, 2, 2 }) |cp, step, mark| {
+        try testing.expectEqual(step, cp.step);
+        try testing.expectEqual(mark, cp.entries[0].offset);
     }
     try testing.expectEqual(@as(?[]KVCacheSnapshot, null), try HotPrefixCache.mergeRingCps(testing.allocator, null, null));
+
+    // An inheritance shares what lies at or below the fork, thinned the same way.
+    const src = try stubRingCps(&.{ 100, 300, 500, 700, 900, 1100, 1300, 1500, 1700, 1900 }, 1);
+    defer HotPrefixCache.freeRingCps(testing.allocator, src);
+    const shared = (try HotPrefixCache.shareRingCpsUpTo(testing.allocator, src, 1800, null)).?;
+    defer HotPrefixCache.freeRingCps(testing.allocator, shared);
+    try testing.expectEqual(RING_CHECKPOINT_MAX, shared.len);
+    try testing.expectEqual(@as(usize, 100), shared[0].step);
+    try testing.expectEqual(@as(usize, 1700), shared[shared.len - 1].step);
+}
+
+/// A ring checkpoint whose one entry holds 4 bf16 rows of 8 in K and in V.
+fn sizedRingCp(step: usize) !KVCacheSnapshot {
+    var cp = try stubRingCp(step, 0);
+    errdefer cp.deinit();
+    const e = &cp.entries[0];
+    try mlx.check(mlx.mlx_zeros(&e.keys, &[_]c_int{ 1, 1, 4, 8 }, 4, .bfloat16, mlx.gpuStream()));
+    try mlx.check(mlx.mlx_zeros(&e.values, &[_]c_int{ 1, 1, 4, 8 }, 4, .bfloat16, mlx.gpuStream()));
+    e.initialized = true;
+    return cp;
+}
+
+test "a ring checkpoint list sheds bytes toward its lowest and its newest" {
+    const bytes_each: u64 = 2 * 4 * 8 * 2;
+    const cps = try testing.allocator.alloc(KVCacheSnapshot, 5);
+    var made: usize = 0;
+    errdefer {
+        for (cps[0..made]) |*c| c.deinit();
+        testing.allocator.free(cps);
+    }
+    for (cps, [_]usize{ 100, 300, 500, 700, 900 }) |*c, step| {
+        c.* = try sizedRingCp(step);
+        made += 1;
+    }
+    const kept = (try HotPrefixCache.thinRingCps(testing.allocator, cps, RING_CHECKPOINT_MAX, 3 * bytes_each)).?;
+    defer HotPrefixCache.freeRingCps(testing.allocator, kept);
+    try testing.expectEqual(@as(usize, 2), kept.len);
+    try testing.expectEqual(@as(usize, 100), kept[0].step);
+    try testing.expectEqual(@as(usize, 900), kept[1].step);
+}
+
+test "ring marks sit at the message starts a prefill forwards, thinned to RING_MARKS_MAX keeping the first and the last" {
+    const im: u32 = 7;
+    var prompt: [2000]u32 = @splat(1);
+    for ([_]usize{ 0, 40, 300, 500, 900, 1100, 1300, 1985 }) |p| prompt[p] = im;
+    var buf: [RING_MARKS_MAX]usize = undefined;
+    // Under the restore floor and inside the prompt end's own reach are skipped.
+    try testing.expectEqualSlices(usize, &.{ 300, 500, 900, 1300 }, ringMarkPositions(&prompt, 0, im, &buf));
+    // A restored prefix is already in the cache: only the tail past it is marked.
+    try testing.expectEqualSlices(usize, &.{ 900, 1100, 1300 }, ringMarkPositions(&prompt, 500, im, &buf));
+    try testing.expectEqual(@as(usize, 0), ringMarkPositions(&prompt, 0, 99, &buf).len);
+    try testing.expectEqual(@as(usize, 0), ringMarkPositions(prompt[0..60], 0, im, &buf).len);
+}
+
+test "a slot's ring restore points are freed by the slot and by a commit that cannot take them" {
+    var held: SlotRingCps = .{ .fork = try stubRingCp(10, 0), .prompt_end = try stubRingCp(90, 0) };
+    held.marks[0] = try stubRingCp(50, 0);
+    held.n_marks = 1;
+    held.deinit();
+    try testing.expectEqual(@as(usize, 0), held.n_marks);
+
+    var cps: SlotRingCps = .{ .fork = try stubRingCp(10, 0), .prompt_end = try stubRingCp(90, 0) };
+    cps.marks[0] = try stubRingCp(50, 0);
+    cps.marks[1] = try stubRingCp(70, 0);
+    cps.n_marks = 2;
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectEqual(@as(?[]KVCacheSnapshot, null), HotPrefixCache.ownRingCps(failing.allocator(), cps));
+
+    var ok: SlotRingCps = .{ .fork = try stubRingCp(10, 0), .prompt_end = try stubRingCp(90, 0) };
+    ok.marks[0] = try stubRingCp(50, 0);
+    ok.n_marks = 1;
+    const owned = HotPrefixCache.ownRingCps(testing.allocator, ok).?;
+    defer HotPrefixCache.freeRingCps(testing.allocator, owned);
+    try testing.expectEqual(@as(usize, 3), owned.len);
+    for (owned, [_]usize{ 10, 50, 90 }) |cp, step| try testing.expectEqual(step, cp.step);
+}
+
+test "a new session sharing only another's preamble restores at the message mark that prefill took" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const window: u32 = 8;
+    const n_layers: u32 = 4;
+    const preamble: u32 = 500;
+    const prompt: u32 = 800;
+    const reply: u32 = 600;
+
+    var toks: [prompt + reply]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
+    var live = try KVCache.init(testing.allocator, n_layers);
+    defer live.deinit();
+    live.setSwaRing(window);
+    var cps: SlotRingCps = .{};
+    defer cps.deinit();
+    // The second mark lies past what this prefill forwards, so it never fills.
+    cps.armMarks(&live, &.{ preamble, prompt + 10 });
+    try testing.expectEqual(@as(usize, 2), cps.n_marks);
+    live.ring_marks = cps.markSlice();
+    // 300-row writes: the one that crosses the mark also compacts the ring past it.
+    try ringFill(&live, s, n_layers, window, 0, prompt, 300);
+    live.ring_marks = &.{};
+    cps.keepCompleteMarks(&live);
+    try testing.expectEqual(@as(usize, 1), cps.n_marks);
+    cps.prompt_end = try live.ringCheckpoint(prompt, s);
+    try ringFill(&live, s, n_layers, window, prompt, prompt + reply, 16);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    const moved = cps;
+    cps = .{};
+    _ = try hc.commitWithRing(&live, &toks, false, 0, 0, null, null, null, null, prompt, moved);
+    try testing.expectEqual(@as(usize, 2), hc.entries.items[0].ring_cps.?.len);
+
+    // Same preamble and message header, then another task.
+    var next: [prompt]u32 = undefined;
+    @memcpy(next[0 .. preamble + 3], toks[0 .. preamble + 3]);
+    for (next[preamble + 3 ..], 0..) |*t, i| t.* = @intCast(900_000 + i);
+    var restored = try KVCache.init(testing.allocator, n_layers);
+    defer restored.deinit();
+    restored.setSwaRing(window);
+    var moe_off: usize = 0;
+    const hit = try hc.lookupAndRestore(&restored, &moe_off, null, s, &next, false, 0, null, null);
+    try testing.expectEqual(@as(usize, preamble), hit.matched);
+
+    var ref = try KVCache.init(testing.allocator, n_layers);
+    defer ref.deinit();
+    ref.setSwaRing(window);
+    try ringFill(&ref, s, n_layers, window, 0, prompt, 64);
+    try ringFill(&restored, s, n_layers, window, preamble, prompt, 64);
+    var li: u32 = 0;
+    while (li < n_layers) : (li += 1) {
+        var rv = try ringWriteLayer(&ref, s, li, prompt, 1, window);
+        defer rv.deinit();
+        var sv = try ringWriteLayer(&restored, s, li, prompt, 1, window);
+        defer sv.deinit();
+        try testing.expectEqual(@as(f32, 0), try transformer_mod.maxAbsDiffF32(rv.k, sv.k, s));
+        try testing.expectEqual(@as(f32, 0), try transformer_mod.maxAbsDiffF32(rv.v, sv.v, s));
+        try testing.expectEqual(ref.absSeqLen(li), restored.absSeqLen(li));
+    }
+}
+
+test "a slot holding every ring restore point it may bills SLOT_RING_CHECKPOINTS checkpoints" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const window: u32 = 8;
+    const n_layers: u32 = 4;
+    var live = try KVCache.init(testing.allocator, n_layers);
+    defer live.deinit();
+    live.setSwaRing(window);
+    var cps: SlotRingCps = .{};
+    defer cps.deinit();
+    try ringFill(&live, s, n_layers, window, 0, 400, 64);
+    cps.fork = try live.ringCheckpoint(400, s);
+    cps.armMarks(&live, &.{ 700, 1000, 1300, 1600, 1700 });
+    try testing.expectEqual(RING_MARKS_MAX, cps.n_marks);
+    live.ring_marks = cps.markSlice();
+    try ringFill(&live, s, n_layers, window, 400, 1900, 256);
+    live.ring_marks = &.{};
+    cps.keepCompleteMarks(&live);
+    cps.prompt_end = try live.ringCheckpoint(1900, s);
+    try testing.expectEqual(RING_MARKS_MAX, cps.n_marks);
+
+    var cp_bytes: u64 = 0;
+    for (live.entries) |*e| {
+        if (e.ringed) cp_bytes += (window + model_mod.ModelConfig.SWA_RING_CHECKPOINT_BACKOFF) * (ringRowBytes(e.keys) + ringRowBytes(e.values));
+    }
+    try testing.expectEqual(@as(u64, SLOT_RING_CHECKPOINTS) * cp_bytes, cps.bytes());
 }
 
 test "an entry extended in place keeps its older ring checkpoints" {
@@ -4417,6 +4789,8 @@ test "a ringed entry persists to the SSD tier and restores only at a ring checkp
     a.setSwaRing(window);
     const hit = try hc2.lookupAndRestore(&a, &moe_off, null, s, &next, false, 0, null, null);
     try testing.expectEqual(@as(usize, prompt), hit.matched);
+    // A ring restore's bill was never measured, so admission credits none of its rows.
+    try testing.expect(!hit.ownsRestoredRows());
     try expectRingContinuesCold(&a, s, n_layers, window, prompt, next.len);
 
     // A verbatim re-send restores at its last token off the ring the entry ended with.
@@ -4426,6 +4800,7 @@ test "a ringed entry persists to the SSD tier and restores only at a ring checkp
     const full = try hc2.lookupAndRestore(&b, &moe_off, null, s, &toks, false, 0, null, null);
     try testing.expect(full.full_match);
     try testing.expectEqual(@as(usize, toks.len - 1), full.matched);
+    try testing.expect(!full.ownsRestoredRows());
     try expectRingContinuesCold(&b, s, n_layers, window, toks.len - 1, toks.len);
 
     // A divergence no ring checkpoint reaches cold-prefills.
@@ -5629,6 +6004,57 @@ test "HotPrefixCache: hybrid disk restore ranks entries by restorable checkpoint
         try testing.expectEqual(@as(usize, 512), res.matched);
         try testing.expectEqual(@as(usize, 512), cache2.step);
     }
+}
+
+test "HotPrefixCache: a hybrid SSD restore hands the slot rows it owns, a RAM share does not" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..root_len];
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var entry_tokens: [520]u32 = undefined;
+    for (&entry_tokens, 0..) |*t, i| t.* = if (i < 512) @intCast(i + 7) else @intCast(i + 900);
+    var src = pcBuildHybrid(s, 100.0, 500.0);
+    defer pcFreeHybrid(&src);
+    {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-hyb-own", 0, 128);
+        defer hc.deinit();
+        var cache = try KVCache.init(testing.allocator, 3);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 3, 520);
+        const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
+        cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 512, s);
+        _ = try hc.commitWithSsm(&cache, &entry_tokens, false, cps, null, null);
+        hc.flushPendingDisk(s);
+
+        var slot = try KVCache.init(testing.allocator, 3);
+        defer slot.deinit();
+        var ssm = pcEmptySsm();
+        defer pcFreeHybrid(&ssm);
+        var moe_off: usize = 0;
+        const ram = try hc.lookupAndRestore(&slot, &moe_off, &ssm, s, &tokens, false, 0, null, null);
+        try testing.expectEqual(@as(usize, 512), ram.matched);
+        // The entry keeps the buffers: the first append copies them, so nothing is credited.
+        try testing.expect(!ram.ownsRestoredRows());
+    }
+
+    var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-hyb-own", 0, 128);
+    defer hc2.deinit();
+    var slot2 = try KVCache.init(testing.allocator, 3);
+    defer slot2.deinit();
+    var ssm2 = pcEmptySsm();
+    defer pcFreeHybrid(&ssm2);
+    var moe_off2: usize = 0;
+    const disk = try hc2.lookupAndRestore(&slot2, &moe_off2, &ssm2, s, &tokens, false, 0, null, null);
+    try testing.expectEqual(@as(usize, 512), disk.matched);
+    try testing.expect(disk.ownsRestoredRows());
 }
 
 test "HotPrefixCache: a hybrid disk restore adopts the spec sidecar of the entry it restored" {
@@ -8389,6 +8815,54 @@ test "a 0-token outcome is not a restore: no LRU bump, no protection, and the en
     try t.expectEqual(@as(usize, 2), rep.entries);
 }
 
+test "off SSD-first too, a 0-token hybrid outcome keeps its entry's recency: the count cap takes it, not another session" {
+    const t = testing;
+    const s = mlx.gpuStream();
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 2, 0);
+    defer hc.deinit();
+    try t.expect(!hc.ssd_first);
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*x, i| x.* = @intCast(i + 7);
+    // The entry the lookup lands on, committed first: a checkpoint but no QSA history, so on a
+    // QSA arch it matches and then restores nothing.
+    var src = try KVCache.init(testing.allocator, 3);
+    defer src.deinit();
+    try testFillCache(&src, s, 3, 600);
+    var src512 = pcBuildHybrid(s, 300.0, 700.0);
+    defer pcFreeHybrid(&src512);
+    const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
+    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src512, 512, s);
+    _ = try hc.commitWithSsm(&src, &tokens, false, cps, null, null);
+    // Another session's entry, committed after it.
+    var other_ids: [600]u32 = undefined;
+    for (&other_ids, 0..) |*x, i| x.* = @intCast(i + 900_007);
+    var other = try KVCache.init(testing.allocator, 3);
+    defer other.deinit();
+    try testFillCache(&other, s, 3, 600);
+    _ = try hc.commit(&other, &other_ids, false);
+    hc.qsa_history_required = true;
+    const used_before = hc.entries.items[0].last_used;
+
+    var slot_cache = try KVCache.init(testing.allocator, 3);
+    defer slot_cache.deinit();
+    var ssm = pcEmptySsm();
+    defer pcFreeHybrid(&ssm);
+    var moe_off: usize = 0;
+    const miss = try hc.lookupAndRestoreWithMedia(&slot_cache, &moe_off, &ssm, s, &tokens, false, 0, null, &.{}, null, null, 0xF5, false);
+    try t.expectEqual(@as(usize, 0), miss.matched);
+    try t.expectEqual(used_before, hc.entries.items[0].last_used);
+
+    var third_ids: [600]u32 = undefined;
+    for (&third_ids, 0..) |*x, i| x.* = @intCast(i + 500_007);
+    var third = try KVCache.init(testing.allocator, 3);
+    defer third.deinit();
+    try testFillCache(&third, s, 3, 600);
+    _ = try hc.commit(&third, &third_ids, false);
+    try t.expectEqual(@as(usize, 2), hc.entryCount());
+    for (hc.entries.items) |e| try t.expect(e.tokens[0] != tokens[0]);
+}
+
 test "the lien weighs the share a restore DELIVERS, not the one it matched" {
     // `findBestRestorableMatch` returns the raw token match but the restore clamps to the highest
     // checkpoint, so `restoreWouldPinEntry` weighing `shared` let a 100k match that delivers 1,024
@@ -10366,4 +10840,172 @@ test "a donated checkout names the bytes its slot now holds; a share names none"
 
     hc.releaseCheckout(0xA11CE, "test");
     try testing.expectEqual(@as(u64, 0), hc.donatedBytes(0xA11CE));
+}
+
+test "HotPrefixCache: disk-only commit persists the full prefix and retains no RAM entry" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..root_len];
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 0, 0);
+        try testing.expectEqual(@as(u32, 0), hc.max_entries);
+        try testing.expect(!hc.ram_enabled);
+        hc.ssd_first = true;
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-disk-only", 0, 128);
+        hc.disk.?.ssd_first = true;
+        hc.disk.?.enableBackgroundWriter();
+        try testing.expect(hc.disk.?.writer != null);
+        defer hc.deinit();
+
+        var cache = try KVCache.init(testing.allocator, 2);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 2, tokens.len);
+        const status = try hc.commit(&cache, &tokens, false);
+        try testing.expectEqual(std.meta.Tag(CommitStatus).disk_only, std.meta.activeTag(status));
+        try testing.expectEqual(@as(usize, tokens.len), status.disk_only);
+        try testing.expectEqual(@as(usize, 0), hc.entryCount());
+        try testing.expectEqual(@as(u64, 0), hc.residentBytes());
+        try testing.expect(hc.pending_disk != null);
+
+        hc.flushPendingDisk(s);
+        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+    }
+
+    {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 0, 0);
+        try testing.expectEqual(@as(u32, 0), hc.max_entries);
+        try testing.expect(!hc.ram_enabled);
+        hc.ssd_first = true;
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-disk-only", 0, 128);
+        hc.disk.?.ssd_first = true;
+        hc.disk.?.enableBackgroundWriter();
+        try testing.expect(hc.disk.?.writer != null);
+        defer hc.deinit();
+
+        var cache = try KVCache.init(testing.allocator, 2);
+        defer cache.deinit();
+        var moe_offset: usize = 0;
+        const restored = try hc.lookupAndRestore(&cache, &moe_offset, null, s, &tokens, false, 0, null, null);
+        try testing.expectEqual(@as(usize, tokens.len - 1), restored.matched);
+        try testing.expectEqual(@as(usize, 0), hc.entryCount());
+        try testing.expectEqual(@as(u64, 0), hc.residentBytes());
+    }
+}
+
+test "HotPrefixCache: SSD-only LFM2 conv state survives background flush and restart" {
+    const a = testing.allocator;
+    const io = testing.io;
+    const s = mlx.gpuStream();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var path: [512]u8 = undefined;
+    const base = path[0..try tmp.dir.realPath(io, &path)];
+    var config = model_mod.ModelConfig{ .model_type = "lfm2", .has_hybrid_layers = true };
+    try testing.expect(HotPrefixCache.shouldUse(&config, true));
+    try testing.expect(ssdFirstActive(&config, true, false));
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*token, i| token.* = @intCast(i + 7);
+    for (0..2) |boot| {
+        var hc = HotPrefixCache.initWithMem(a, 0, 0);
+        hc.ssd_first = true;
+        hc.disk = try kv_disk_cache.DiskTier.init(a, io, base, "lfm-conv", 0, 128);
+        hc.disk.?.ssd_first = true;
+        hc.disk.?.enableBackgroundWriter();
+        defer hc.deinit();
+        try testing.expect(hc.disk.?.writer != null);
+        var cache = try KVCache.init(a, 3);
+        defer cache.deinit();
+        if (boot == 0) {
+            var written: u32 = 0;
+            while (written < tokens.len) : (written += 64) {
+                try testWriteCacheLayer(&cache, s, 1, written, @intCast(@min(64, tokens.len - written)));
+            }
+            var source = pcEmptySsm();
+            defer pcFreeHybrid(&source);
+            _ = mlx.mlx_array_free(source[0].conv_state);
+            source[0].conv_state = pcArange(s, &conv_shape_pc, 300);
+            source[0].initialized = true;
+            const cps = try a.alloc(SSMCheckpoint, 1);
+            cps[0] = try transformer_mod.captureSsmCheckpoint(a, &source, 512, s);
+            const status = try hc.commitWithSsm(&cache, &tokens, false, cps, null, null);
+            try testing.expectEqual(std.meta.Tag(CommitStatus).disk_only, std.meta.activeTag(status));
+            try testing.expectEqual(std.meta.Tag(CommitStatus).disk_only, std.meta.activeTag(status));
+            try testing.expectEqual(@as(usize, tokens.len), status.disk_only);
+            hc.flushPendingDisk(s);
+            hc.disk.?.drainWriter();
+            try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
+        } else {
+            var restored = pcEmptySsm();
+            defer pcFreeHybrid(&restored);
+            var offset: usize = 0;
+            const hit = try hc.lookupAndRestore(&cache, &offset, &restored, s, &tokens, false, 0, null, null);
+            try testing.expectEqual(@as(usize, 512), hit.matched);
+            try testing.expectEqual(@as(usize, 512), offset);
+            try testing.expect(!cache.entries[0].initialized);
+            try testing.expect(cache.entries[1].initialized);
+            try testing.expectEqual(@as(usize, 512), cache.entries[1].offset);
+            try testing.expect(restored[0].initialized);
+            try testing.expectEqual(@as(f32, 300), pcSsmVal(restored[0].conv_state, 0, s));
+            try testing.expect(restored[0].ssm_state.ctx == null);
+        }
+        try testing.expectEqual(@as(usize, 0), hc.entryCount());
+        try testing.expectEqual(@as(u64, 0), hc.residentBytes());
+    }
+}
+
+test "SSD-only ring checkpoints survive restart without idle RAM" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = testing.io;
+    const s = mlx.gpuStream();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var path: [512]u8 = undefined;
+    const base = path[0..try tmp.dir.realPath(io, &path)];
+    const prompt: u32 = 700;
+    const total: u32 = 1300;
+    const window: u32 = 8;
+    const layers: u32 = 4;
+    var tokens: [total]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 1);
+    for (0..2) |boot| {
+        var hc = HotPrefixCache.initWithMem(a, 0, 0);
+        hc.ssd_first = true;
+        hc.disk = try kv_disk_cache.DiskTier.init(a, io, base, "ssd-only-ring", 0, 128);
+        hc.disk.?.ssd_first = true;
+        hc.disk.?.enableBackgroundWriter();
+        defer hc.deinit();
+        var cache = try KVCache.init(a, layers);
+        defer cache.deinit();
+        cache.setSwaRing(window);
+        if (boot == 0) {
+            try ringFill(&cache, s, layers, window, 0, prompt, 16);
+            const cp = try cache.ringCheckpoint(prompt, s);
+            try ringFill(&cache, s, layers, window, prompt, total, 16);
+            const status = try hc.commitWithRing(&cache, &tokens, false, 0, 0, null, null, null, null, prompt, .{ .prompt_end = cp });
+            try testing.expectEqual(std.meta.Tag(CommitStatus).disk_only, std.meta.activeTag(status));
+            hc.flushPendingDisk(s);
+            hc.disk.?.drainWriter();
+            try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
+        } else {
+            var next: [800]u32 = undefined;
+            @memcpy(next[0..prompt], tokens[0..prompt]);
+            for (next[prompt..], 0..) |*t, i| t.* = @intCast(90_000 + i);
+            var offset: usize = 0;
+            const hit = try hc.lookupAndRestore(&cache, &offset, null, s, &next, false, 0, null, null);
+            try testing.expectEqual(@as(usize, prompt), hit.matched);
+            try testing.expect(!hit.ownsRestoredRows());
+            try testing.expectEqual(@as(usize, prompt), offset);
+        }
+        try testing.expectEqual(@as(usize, 0), hc.entryCount());
+        try testing.expectEqual(@as(u64, 0), hc.residentBytes());
+    }
 }

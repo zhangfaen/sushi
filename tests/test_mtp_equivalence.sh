@@ -1,5 +1,7 @@
 #!/bin/bash
-# MTP (Qwen native multi-token-prediction head) correctness + engagement test.
+# MTP (native multi-token-prediction head) correctness + engagement test, for both served
+# archs: Qwen's head and MiMo-V2.6's three heads (`model_type` from config.json picks the
+# markers, the engagement lines and whether reasoning is part of the compared answer).
 #
 # Contract pinned here:
 #   1. ENGAGEMENT — with an MTP sidecar present, every request on
@@ -35,6 +37,12 @@
 # MoE trunks (35B-A3B, qwen4_exp) keep MTP default-OFF per request; set
 # MTP_FORCE_ENABLE=1 to inject "enable_mtp":true into every request body so
 # engagement + acceptance-floor checks exercise the MoE head arm.
+#
+# mimo_v2 (MTP_TEST_MODEL=<MiMo pack>): a pack without its heads FAILS, never skips. Its
+# thinking is on by default, so reasoning + content is the compared answer. It checks the
+# qk-192 fused prefill engagement instead of Qwen's hd-256 and GDN lines, the head-count
+# depth cap instead of the chunk-B extension, and adds a SUSHI_MTP_FORCE_DEPTH=3 boot that
+# must be byte-identical to --no-mtp. Its copy task runs prompt-lookup rounds as Qwen's does.
 
 set -u
 MODEL="${MTP_TEST_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}"
@@ -42,6 +50,11 @@ PORT="${1:-11313}"
 BIN="${SUSHI_BINARY:-./zig-out/bin/sushi}"
 EXTRA_ARGS="${SUSHI_TEST_EXTRA_ARGS:-}"
 MAX_TOKENS=120
+ARCH=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("model_type", ""))' "$MODEL/config.json" 2>/dev/null)
+# MiMo answers inside a think block by default: compare the reasoning too.
+REASONING=0
+[ "$ARCH" = mimo_v2 ] && REASONING=1
+export REASONING
 PROMPT="Write a short story about a robot learning to paint."
 EXPECT_AUTO_PROFILE="${MTP_EXPECT_AUTO_PROFILE:-}"
 EXPECT_AUTO_DEPTH="${MTP_EXPECT_AUTO_DEPTH:-}"
@@ -74,6 +87,7 @@ markers = {
     "language_model.mtp.eh_proj.weight",
     "mtp.fc_hidden.weight",
     "language_model.mtp.fc_hidden.weight",
+    "model.mtp.layers.0.eh_proj.weight",
 }
 
 try:
@@ -96,7 +110,7 @@ PY
 }
 
 if [ ! -d "$MODEL" ] || ! checkpoint_has_mtp_head; then
-    if [ -n "$EXPECT_AUTO_PROFILE" ]; then
+    if [ -n "$EXPECT_AUTO_PROFILE" ] || [ "$ARCH" = mimo_v2 ]; then
         echo "FAIL: required MTP checkpoint not detected at $MODEL"
         exit 1
     fi
@@ -164,7 +178,13 @@ chat_nonstream() {
     curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' -d "{
         $OPTIN\"model\":\"default\",\"stream\":false,\"temperature\":0,\"max_tokens\":$MAX_TOKENS,
         \"messages\":[{\"role\":\"user\",\"content\":\"$PROMPT\"}]}" |
-        python3 -c "import json,sys; print(json.load(sys.stdin)['choices'][0]['message']['content'], end='')"
+        python3 -c "
+import json, os, sys
+m = json.load(sys.stdin)['choices'][0]['message']
+if os.environ['REASONING'] == '1':
+    print((m.get('reasoning_content') or '') + '\x01' + (m.get('content') or ''), end='')
+else:
+    print(m['content'], end='')"
 }
 
 chat_stream() {
@@ -173,7 +193,9 @@ chat_stream() {
         \"messages\":[{\"role\":\"user\",\"content\":\"$PROMPT\"}]}" |
         python3 -c "
 import json, sys
+import os
 out = []
+think = []
 for line in sys.stdin:
     line = line.strip()
     if not line.startswith('data: ') or line == 'data: [DONE]': continue
@@ -181,6 +203,9 @@ for line in sys.stdin:
     except Exception: continue
     for c in d.get('choices', []):
         out.append(c.get('delta', {}).get('content') or '')
+        think.append(c.get('delta', {}).get('reasoning_content') or '')
+if os.environ['REASONING'] == '1':
+    print(''.join(think) + '\x01', end='')
 print(''.join(out), end='')"
 }
 
@@ -188,7 +213,12 @@ messages_nonstream() {
     curl -s "http://127.0.0.1:$PORT/v1/messages" -H 'Content-Type: application/json' -d "{
         $OPTIN\"model\":\"default\",\"stream\":false,\"max_tokens\":$MAX_TOKENS,\"temperature\":0,
         \"messages\":[{\"role\":\"user\",\"content\":\"$PROMPT\"}]}" |
-        python3 -c "import json,sys; print(''.join(b.get('text','') for b in json.load(sys.stdin)['content']), end='')"
+        python3 -c "
+import json, os, sys
+blocks = json.load(sys.stdin)['content']
+if os.environ['REASONING'] == '1':
+    print(''.join(b.get('thinking', '') for b in blocks if b.get('type') == 'thinking') + '\x01', end='')
+print(''.join(b.get('text','') for b in blocks), end='')"
 }
 
 # A copy task: return a file with one rename. Built as JSON by python (the
@@ -350,8 +380,10 @@ stop_server
 
 echo "── MTP server (default-on) ──"
 start_server ""
-# The qwen4_exp head is the checkpoint's own layer and logs its own line.
-if ! grep -q "MTP head ready\|\[qwen4\] MTP head loaded" "$LOG"; then
+# The qwen4_exp head is the checkpoint's own layer and logs its own line; MiMo's heads log theirs.
+HEAD_READY="MTP head ready\|\[qwen4\] MTP head loaded"
+[ "$ARCH" = mimo_v2 ] && HEAD_READY="\[mimo-mtp\] [0-9]* heads loaded"
+if ! grep -q "$HEAD_READY" "$LOG"; then
     echo "FAIL: server did not auto-load the MTP sidecar"; tail -5 "$LOG"; FAIL=$((FAIL+1))
 else
     echo "PASS [mtp auto-load]"; PASS=$((PASS+1))
@@ -397,9 +429,12 @@ else
 fi
 # Fused-kernel engagement (anti-silent-no-op, kv-quant class): every qwen
 # 3.5/3.6 checkpoint is hd 256 with GDN layers, so both fusions must fire on
-# the verify widths this server just ran. Output equality alone is blind to a
+# the verify widths this server just ran. MiMo's global and sliding layers both
+# prefill through the fused qk-192 kernel. Output equality alone is blind to a
 # decline gate quietly routing everything back to the composed chain.
-for ENGAGE_LINE in "\[attn\] fused QK-norm+RoPE (hd-256) engaged" "\[gdn\] packed prework engaged"; do
+ENGAGE_LINES=("\[attn\] fused QK-norm+RoPE (hd-256) engaged" "\[gdn\] packed prework engaged")
+[ "$ARCH" = mimo_v2 ] && ENGAGE_LINES=("\[attn-pd\] engaged" "\[attn-pd\] sliding band engaged")
+for ENGAGE_LINE in "${ENGAGE_LINES[@]}"; do
     if grep -q "$ENGAGE_LINE" "$LOG"; then
         echo "PASS [engaged: $ENGAGE_LINE]"; PASS=$((PASS+1))
     else
@@ -435,7 +470,16 @@ curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: applicati
     $OPTIN\"model\":\"default\",\"stream\":false,\"temperature\":0,\"max_tokens\":160,
     \"messages\":[{\"role\":\"user\",\"content\":\"$ECHO_PROMPT\"}]}" >/dev/null
 EXT=$(grep -o 'ext_rounds=[0-9]*' "$LOG" | tail -1 | cut -d= -f2)
-if [ "${EXT:-0}" -gt 0 ]; then
+if [ "$ARCH" = mimo_v2 ]; then
+    # MiMo drafts at most one token per head: the echo runs at the three-head cap.
+    ECHO_DEPTH=$(grep -o '\[spec-stats\] mode=mtp.*' "$LOG" | tail -1 | grep -o ' depth=[0-9]*' | grep -o '[0-9]*')
+    if [ "${ECHO_DEPTH:-0}" = "3" ]; then
+        echo "PASS [MiMo depth at its head count on echo] (depth=$ECHO_DEPTH)"; PASS=$((PASS+1))
+    else
+        echo "FAIL [MiMo depth cap]: depth=${ECHO_DEPTH:-none} on echo, want 3 (one draft per head)"
+        FAIL=$((FAIL+1))
+    fi
+elif [ "${EXT:-0}" -gt 0 ]; then
     echo "PASS [EV chunk-B extension engages on echo] (ext_rounds=$EXT)"; PASS=$((PASS+1))
 else
     echo "FAIL [EV chunk-B extension]: ext_rounds=${EXT:-none} on a max-confidence echo — extension path never fired"
@@ -507,6 +551,21 @@ else
     echo "FAIL [prompt lookup on the seeded copy]: no lookup round"; FAIL=$((FAIL+1))
 fi
 stop_server
+
+if [ "$ARCH" = mimo_v2 ]; then
+    echo "── forced-depth server (SUSHI_MTP_FORCE_DEPTH=3) ──"
+    # Every MiMo verify row keeps its decode tick's arithmetic, so a forced depth-3 round
+    # must reproduce --no-mtp byte for byte.
+    export SUSHI_MTP_FORCE_DEPTH=3
+    start_server ""
+    unset SUSHI_MTP_FORCE_DEPTH
+    ENGAGE_BASE=$(grep -c "\[spec-stats\] mode=mtp" "$LOG")
+    chat_nonstream > "$ARTIFACTS/mtp_forced_chat.txt"
+    check "forced depth 3, chat non-stream" "$ARTIFACTS/mtp_base_chat.txt" "$ARTIFACTS/mtp_forced_chat.txt" yes
+    messages_nonstream > "$ARTIFACTS/mtp_forced_msg.txt"
+    check "forced depth 3, messages non-stream" "$ARTIFACTS/mtp_base_msg.txt" "$ARTIFACTS/mtp_forced_msg.txt" yes
+    stop_server
+fi
 
 echo
 printf '{"passed":%s,"failed":%s,"acquittals":0}\n' "$PASS" "$FAIL" >"$ARTIFACTS/result.json"

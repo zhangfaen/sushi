@@ -27,9 +27,13 @@ struct SushiNax {
     op.run(ca, cb, cc);
     SUSHI_UNROLL for (short i = 0; i < 8; i++) { c0[i] = cc[i]; c1[i] = cc[8 + i]; }
   }
-  // A 16x16 fragment whose two lane rows start at p0 and p1 (column offset included).
-  template <typename T, typename P>
-  static void load2(thread metal::vec<T, 8>& d, P p0, P p1) {
-    SUSHI_UNROLL for (short j = 0; j < 4; j++) { d[j] = T(p0[j]); d[4 + j] = T(p1[j]); }
+  // A 16x16 fragment whose two lane rows start at p0 and p1 (column offset included), each row's
+  // four elements read as one vector (element-wise reads are slower in the attention loop). Rows must
+  // start 8-byte aligned: a misaligned one reads correctly on M5 but is undefined in MSL.
+  template <typename T>
+  static void load2(thread metal::vec<T, 8>& d, const device T* p0, const device T* p1) {
+    const metal::vec<T, 4> a = *(const device metal::vec<T, 4>*)p0;
+    const metal::vec<T, 4> b = *(const device metal::vec<T, 4>*)p1;
+    SUSHI_UNROLL for (short j = 0; j < 4; j++) { d[j] = a[j]; d[4 + j] = b[j]; }
   }
 };

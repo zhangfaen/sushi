@@ -3,6 +3,7 @@
 //!
 //!   sushi run qwen3.8-flash-next          # download if missing, serve, drop into a REPL
 //!   sushi pull qwen3.8-flash-next:2.6bpw  # download only
+//!   sushi run mimo-v2.6-flash             # MiMo-V2.6-Flash (128 GB)
 //!   sushi list                            # what's on disk
 //!
 //! Short names resolve through the published Sushi packs (`aliases`);
@@ -77,11 +78,12 @@ pub const Alias = struct {
 };
 
 /// The published Sushi packs. The bare name picks 3bpw: 2.6bpw needs the same
-/// 64 GB and scores worse on KLD; 4bpw needs 96 GB.
+/// 64 GB and scores worse on KLD; 4bpw needs 96 GB. MiMo's one pack needs 128 GB.
 pub const aliases = [_]Alias{
     .{ .name = "qwen3.8-flash-next", .tag = "2.6bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw" },
     .{ .name = "qwen3.8-flash-next", .tag = "3bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-3bpw", .is_default = true },
     .{ .name = "qwen3.8-flash-next", .tag = "4bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-4bpw" },
+    .{ .name = "mimo-v2.6-flash", .tag = "2.3bpw", .repo = "beamster/MiMo-V2.6-Flash-Sushi-2.3bpw", .is_default = true },
 };
 
 pub const Resolved = struct {
@@ -1542,6 +1544,9 @@ test "cli: resolveShortName aliases, tags, org/repo, hf.co, unknown" {
     try testing.expectEqualStrings("beamster/Qwen3.8-Flash-Next-Sushi-4bpw", resolveShortName("QWEN3.8-FLASH-NEXT:4BPW").?.repo);
     // :latest behaves like bare.
     try testing.expectEqualStrings("beamster/Qwen3.8-Flash-Next-Sushi-3bpw", resolveShortName("qwen3.8-flash-next:latest").?.repo);
+    // MiMo's one published pack, bare or tagged.
+    try testing.expectEqualStrings("beamster/MiMo-V2.6-Flash-Sushi-2.3bpw", resolveShortName("mimo-v2.6-flash").?.repo);
+    try testing.expectEqualStrings("beamster/MiMo-V2.6-Flash-Sushi-2.3bpw", resolveShortName("MiMo-V2.6-Flash:2.3bpw").?.repo);
     // Direct org/repo passthrough, tag stripped, hf.co prefixes stripped.
     try testing.expectEqualStrings("org/repo", resolveShortName("org/repo").?.repo);
     try testing.expectEqualStrings("org/repo", resolveShortName("org/repo:latest").?.repo);
@@ -1554,7 +1559,8 @@ test "cli: resolveShortName aliases, tags, org/repo, hf.co, unknown" {
 }
 
 test "cli: every short name is a published Sushi pack" {
-    for (aliases) |a| try testing.expect(std.mem.startsWith(u8, a.repo, "beamster/Qwen3.8-Flash-Next-Sushi-"));
+    for (aliases) |a| try testing.expect(std.mem.startsWith(u8, a.repo, "beamster/Qwen3.8-Flash-Next-Sushi-") or
+        std.mem.startsWith(u8, a.repo, "beamster/MiMo-V2.6-Flash-Sushi-"));
 }
 
 test "cli: modelDestPath layout" {

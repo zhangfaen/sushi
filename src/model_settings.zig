@@ -35,6 +35,12 @@ pub fn sourceLabel(source: Source, flag_name: []const u8) []const u8 {
 /// request's `chat_template_kwargs.preserve_thinking` outranks it.
 pub var preserve_thinking_flag: ?bool = null;
 
+/// `--think-penalty <lambda>`; null = not given. A request's `think_penalty` outranks it.
+pub var think_penalty_flag: ?f32 = null;
+pub var logit_bias_file_flag: ?[]const u8 = null;
+/// The largest think penalty any source may set, in logits.
+pub const think_penalty_max: f32 = 20;
+
 /// A launch value counts as a flag only when the operator passed it.
 pub fn launchFlag(comptime T: type, value: T, explicit: bool) ?T {
     return if (explicit) value else null;
@@ -116,10 +122,13 @@ pub const Override = struct {
     mtp_greedy_tail: ?bool = null,
     ssd_budget_gb: ?u32 = null,
     preserve_thinking: ?bool = null,
+    think_penalty: ?f32 = null,
+    logit_bias_file: ?@import("logit_bias.zig").FilePath = null,
 
     pub fn isEmpty(o: Override) bool {
         return o.ctx_size == null and o.kv_quant == null and o.mtp == null and
-            o.mtp_acceptance == null and o.mtp_greedy_tail == null and o.ssd_budget_gb == null and o.preserve_thinking == null;
+            o.mtp_acceptance == null and o.mtp_greedy_tail == null and o.ssd_budget_gb == null and o.preserve_thinking == null and
+            o.think_penalty == null and o.logit_bias_file == null;
     }
 };
 
@@ -188,6 +197,18 @@ fn fromValue(v: std.json.Value) Override {
         .bool => |b| o.preserve_thinking = b,
         else => {},
     };
+    if (obj.get("logit_bias_file")) |path_value| switch (path_value) {
+        .string => |path| o.logit_bias_file = @import("logit_bias.zig").FilePath.from(path),
+        else => {},
+    };
+    const lambda: ?f64 = if (obj.get("think_penalty")) |t| switch (t) {
+        .float => |f| f,
+        .integer => |i| @floatFromInt(i),
+        else => null,
+    } else null;
+    if (lambda) |l| if (l >= 0 and l <= think_penalty_max) {
+        o.think_penalty = @floatCast(l);
+    };
     return o;
 }
 
@@ -219,7 +240,7 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
     var s = load(alloc, io, defaultPath(&buf));
     defer s.deinit();
     const o = s.lookup(model_path);
-    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} ssd_budget_gb={d} preserve_thinking={s}\n", .{
+    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} ssd_budget_gb={d} preserve_thinking={s} think_penalty={d}\n", .{
         model_path,
         o.ctx_size orelse 0,
         if (o.kv_quant) |k| k.wireName() else "default",
@@ -228,6 +249,7 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
         if (o.mtp_greedy_tail) |g| (if (g) "on" else "off") else "default",
         o.ssd_budget_gb orelse 0,
         if (o.preserve_thinking) |p| (if (p) "on" else "off") else "default",
+        o.think_penalty orelse 0,
     });
     return o;
 }
@@ -366,6 +388,19 @@ test "a streamed load drops only the MTP --fast asked for" {
     }
 }
 
+test "model_settings: think_penalty is a non-negative number, anything else is unset" {
+    var s = try parse(std.testing.allocator,
+        \\{"/m/a": {"think_penalty": 1.5}, "/m/b": {"think_penalty": 2}, "/m/c": {"think_penalty": -1}, "/m/d": {"think_penalty": "1"}, "/m/e": {"think_penalty": 0}}
+    );
+    defer s.deinit();
+    try std.testing.expectEqual(@as(?f32, 1.5), s.lookup("/m/a").think_penalty);
+    try std.testing.expectEqual(@as(?f32, 2), s.lookup("/m/b").think_penalty);
+    try std.testing.expect(s.lookup("/m/c").isEmpty());
+    try std.testing.expect(s.lookup("/m/d").isEmpty());
+    try std.testing.expectEqual(@as(?f32, 0), s.lookup("/m/e").think_penalty);
+    try std.testing.expect(!s.lookup("/m/e").isEmpty());
+}
+
 test "model_settings: preserve_thinking is a bool, anything else is unset" {
     var s = try parse(std.testing.allocator,
         \\{"/m/a": {"preserve_thinking": false}, "/m/b": {"preserve_thinking": true}, "/m/c": {"preserve_thinking": "off"}}
@@ -375,4 +410,10 @@ test "model_settings: preserve_thinking is a bool, anything else is unset" {
     try std.testing.expect(!s.lookup("/m/a").isEmpty());
     try std.testing.expectEqual(@as(?bool, true), s.lookup("/m/b").preserve_thinking);
     try std.testing.expect(s.lookup("/m/c").isEmpty());
+}
+
+test "logit bias CPU: file setting is a populated override" {
+    var s = try parse(std.testing.allocator, "{\"/m/a\":{\"logit_bias_file\":\"bias.json\"}}");
+    defer s.deinit();
+    try std.testing.expect(!s.lookup("/m/a").isEmpty());
 }

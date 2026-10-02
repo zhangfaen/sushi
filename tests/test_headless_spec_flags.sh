@@ -47,27 +47,35 @@ fi
 
 EMPTY_DIR="$(mktemp -d)"
 LOG="$(mktemp)"
+SERVER_PID=""
 cleanup() {
-    pkill -f "sushi.*--port $PORT" 2>/dev/null
+    [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
     rm -rf "$EMPTY_DIR" "$LOG"
 }
 trap cleanup EXIT
 
+require_free_port() {
+    if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+        echo "port $PORT is already in use; stop that server or pass another port" >&2
+        exit 1
+    fi
+}
+
 # Boot headless over the empty dir, capture the banner, stop. Prints nothing;
 # the caller greps "$LOG".
 boot() {
-    pkill -f "sushi.*--port $PORT" 2>/dev/null
-    sleep 0.5
+    require_free_port
     : > "$LOG"
     "$BINARY" --serve --model-dir "$EMPTY_DIR" --port "$PORT" --log-file off "$@" > "$LOG" 2>&1 &
     local pid=$!
+    SERVER_PID=$pid
     for _ in $(seq 1 60); do
         curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
         sleep 0.5
         kill -0 "$pid" 2>/dev/null || break
     done
     curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 || {
-        echo "  (server did not come up; log follows)"; cat "$LOG"; kill "$pid" 2>/dev/null; return 1
+        echo "  (server did not come up; log follows)"; cat "$LOG"; kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; return 1
     }
     kill "$pid" 2>/dev/null
     wait "$pid" 2>/dev/null
@@ -128,11 +136,11 @@ fi
 # surface absent against a headless boot for exactly this reason (2026-07-25).
 # Headless with an EMPTY model dir is the only place this is observable.
 echo "[5/6] endpoint existence does not depend on a model being loaded"
-pkill -f "sushi.*--port $PORT" 2>/dev/null
-sleep 0.5
+require_free_port
 : > "$LOG"
 "$BINARY" --serve --model-dir "$EMPTY_DIR" --port "$PORT" --log-file off > "$LOG" 2>&1 &
 HPID=$!
+SERVER_PID=$HPID
 for _ in $(seq 1 60); do
     curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
     sleep 0.5

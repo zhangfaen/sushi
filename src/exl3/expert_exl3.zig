@@ -81,8 +81,8 @@ pub const Decode = struct {
 pub const Rate = struct {
     n: u32,
 
-    pub const min_n: u32 = 32;
-    pub const max_n: u32 = 64;
+    pub const min_n: u32 = 16;
+    pub const max_n: u32 = 128;
 
     pub fn fromK(k: u32) Rate {
         return .{ .n = k * @as(u32, TILE) };
@@ -128,7 +128,7 @@ pub fn packedHalfwords(k: u32) usize {
     return TILE_VALUES * @as(usize, k) / 16;
 }
 
-/// K2 to K4 in 1/8-bit steps. An odd n would leave a tile's bitstream short of
+/// K1 to K8 in 1/8-bit steps. An odd n would leave a tile's bitstream short of
 /// a whole uint32 word, which every reader indexes by.
 pub fn kFromPackedDim(packed_hw: usize) ?Rate {
     if (packed_hw % 2 != 0) return null;
@@ -463,15 +463,15 @@ fn asU16(view: TensorView) []const u16 {
     return @alignCast(std.mem.bytesAsSlice(u16, view.bytes));
 }
 
-test "exl3 packed dim is an even halfword count from K2 to K4 and prints as a rate" {
+test "exl3 packed dim is an even halfword count from K1 to K8 and prints as a rate" {
     const t = std.testing;
     var buf: [8]u8 = undefined;
     try t.expectEqual(@as(u32, 32), kFromPackedDim(32).?.n);
     try t.expectEqual(@as(u32, 40), kFromPackedDim(40).?.n);
     try t.expectEqual(@as(u32, 44), kFromPackedDim(44).?.n);
     try t.expectEqual(@as(u32, 64), kFromPackedDim(64).?.n);
-    try t.expectEqual(@as(?Rate, null), kFromPackedDim(16));
-    try t.expectEqual(@as(?Rate, null), kFromPackedDim(80));
+    try t.expectEqual(@as(?Rate, null), kFromPackedDim(14));
+    try t.expectEqual(@as(?Rate, null), kFromPackedDim(130));
     try t.expectEqual(@as(?Rate, null), kFromPackedDim(41));
     try t.expectEqualStrings("2", kFromPackedDim(32).?.kText(&buf));
     try t.expectEqualStrings("2.5", kFromPackedDim(40).?.kText(&buf));
@@ -736,5 +736,48 @@ test "exl3 the reference decode narrows the codeword window at w8 and w10" {
         // The narrowed window is a different weight matrix, not a rounding of
         // the wide one: a pack read at the wrong width decodes to noise.
         try t.expect(!std.mem.eql(u16, &wide, &got));
+    }
+}
+
+test "exl3 Sushi CPU rates admit every even halfword count from 16 through 128" {
+    for (0..145) |n| {
+        const got = kFromPackedDim(n);
+        if (n >= 16 and n <= 128 and n % 2 == 0) {
+            try std.testing.expect(got != null);
+            try std.testing.expectEqual(@as(u32, @intCast(n)), got.?.n);
+        } else try std.testing.expect(got == null);
+    }
+}
+
+test "exl3 Sushi CPU scalar tiles match independent circular bit extraction" {
+    var prng = std.Random.DefaultPrng.init(0x51555348);
+    var words: [128]u16 = undefined;
+    var perm: [256]usize = undefined;
+    tensorCorePerm(&perm);
+    for (8..65) |half| {
+        const n = half * 2;
+        const rate: Rate = .{ .n = @intCast(n) };
+        for (0..16) |_| {
+            for (words[0..n]) |*w| w.* = prng.random().int(u16);
+            var want: [256]u16 = undefined;
+            for (&want, 0..) |*cw, slot| {
+                cw.* = 0;
+                for (0..16) |bit| {
+                    const at = ((slot + 1) * n / 16 + 16 * n - 16 + bit) % (16 * n);
+                    const v = (words[2 * (at / 32) + (1 - (at % 32) / 16)] >> @as(u4, @intCast(15 - at % 16))) & 1;
+                    cw.* = (cw.* << 1) | v;
+                }
+            }
+            var got: [256]u16 = undefined;
+            unpackTile(words[0..n], rate, &got);
+            try std.testing.expectEqualSlices(u16, &want, &got);
+            for ([_]Codebook{ .mul1, .mcg }) |cb| {
+                for (8..17) |bits| {
+                    const window = Window.fromBits(@intCast(bits)).?;
+                    decodeTile(words[0..n], rate, .{ .codebook = cb, .window = window }, &got);
+                    for (want, 0..) |cw, slot| try std.testing.expectEqual(decodeCodeword(cw & window.mask(), cb), got[perm[slot]]);
+                }
+            }
+        }
     }
 }

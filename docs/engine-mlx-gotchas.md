@@ -62,6 +62,8 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
 - `.string` on unchecked `std.json.Value` panics.
 - A test that aliases embedded bytes through an alignment cast is a coin flip per binary: copy fixtures to aligned
   storage (Debug builds catch what ReleaseFast hides).
+- A failing `std.debug.assert` is UB in ReleaseFast: the full suite can pass while the same test, filtered alone,
+  dies with SIGTRAP (inlining decides whether the trap is emitted). Rerun it under ReleaseSafe for the panic.
 
 ## Tokenizer
 
@@ -69,3 +71,14 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
   vocab-derived collection needs an index.
 - A hand-rolled pretokenizer is calibrated to ONE tokenizer.json — digit GROUPING is per-model (`digit_group`);
   cross-check `/tokenize` vs HF at bring-up.
+- Unicode segmentation is model-local: the exact supported `Split` regex and `Isolated`/`invert:false` +
+  `ByteLevel(use_regex:false, add_prefix_space:false)` pipeline select the rule. MiMo's word branch is `\p{L}+`;
+  Qwen's is `[\p{L}\p{M}]+`. Marks therefore belong in different branches. Never select this by language,
+  directory name or architecture, and never fix Thai by extending a shared block-range heuristic.
+- These two grammars use Unicode 16.0 general-category tables (regenerate with
+  `scripts/gen-tokenizer-unicode.py` on Python 3.14). Other pre-tokenizer pipelines retain their existing path.
+  Exact token IDs matter: decoding back to the same text does **not** prove correct segmentation.
+  Guards: hermetic cross-grammar BPE fixtures in `tokenizer.zig` + the format corpus;
+  `tests/test_tokenizer_reference.sh` compares both real tokenizer files to HF on CPU without loading weights.
+  Its synthetic inputs are normalized first to isolate Split/BPE: the older missing NFC-normalizer behavior on
+  decomposed text is a separate, still-open issue. `TOKENIZER_CASES_JSON` can add an already-normalized prompt pack.

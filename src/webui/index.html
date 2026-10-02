@@ -544,6 +544,8 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
   max-width: 320px;
   min-width: 0;
 }
+#toolsButton { flex: none; white-space: nowrap; }
+#toolsButton[aria-pressed="true"] { color: var(--accent); border-color: currentColor; }
 .chip-toggle svg { width: 13px; height: 13px; flex: none; }
 .chip-toggle span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #composerEffortName { color: var(--accent); flex: none; }
@@ -758,7 +760,7 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
           <img class="mark" alt="" />
           <h2>Chat with sushi</h2>
           <p>Talk to the model this Mac is serving.</p>
-          <div class="privacy-chip"><svg><use href="#i-shield"/></svg>Runs on this machine. Nothing is sent anywhere else.</div>
+          <div class="privacy-chip"><svg><use href="#i-shield"/></svg>Chat runs on this machine. Optional web tools access public sites.</div>
           <div class="suggestions" id="chatSuggestions"></div>
         </div>
         <div id="chatMessages" aria-live="polite"></div>
@@ -774,6 +776,7 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px
             <button class="icon-btn" id="attachButton" title="Attach images" aria-label="Attach images" hidden><svg><use href="#i-image"/></svg></button>
             <input id="attachInput" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/bmp" multiple hidden>
             <button class="chip-toggle" id="composerModelLabel" title="Choose the model and thinking effort" aria-label="Choose the model and thinking effort"><svg><use href="#i-box"/></svg><span id="composerModelName">no model</span><span>/</span><span id="composerEffortName">default</span></button>
+            <button class="chip-toggle" id="toolsButton" aria-pressed="false" title="Enable web search, page fetching and read-only files in the server folder">Tools off</button>
             <span class="spacer"></span>
             <button id="stopButton" aria-label="Stop generating" title="Stop" hidden><svg><use href="#i-stop"/></svg></button>
             <button id="sendButton" aria-label="Send message" title="Send"><svg><use href="#i-send"/></svg></button>
@@ -1673,6 +1676,13 @@ function regenerateButton() {
   return regen;
 }
 function appendMessageNode(message, { last = false } = {}) {
+  if (message.toolImages) return;
+  if (message.role === "tool") {
+    const details = el("details", "thinking");
+    details.append(el("summary", null, message.name || "Tool result"), el("div", "t-body", message.content));
+    $("chatMessages").appendChild(details);
+    return details;
+  }
   $("chatEmpty").hidden = true;
   const node = el("div", `msg ${message.role}${last ? " last" : ""}`);
   if (message.role === "user") {
@@ -1701,8 +1711,9 @@ function appendMessageNode(message, { last = false } = {}) {
       thinking.append(summary, el("div", "t-body", message.reasoning));
       node.appendChild(thinking);
     }
+    if (message.tool_calls?.length) node.appendChild(el("div", "msg-note", `Tools: ${message.tool_calls.map((call) => call.function.name).join(", ")}`));
     const content = el("div", "content");
-    content.appendChild(renderMarkdown(message.content));
+    content.appendChild(renderMarkdown(message.content || ""));
     node.appendChild(content);
     const extras = [];
     if (message.meta) extras.push(el("span", "msg-meta", message.meta));
@@ -1863,6 +1874,26 @@ async function addComposerFiles(fileList) {
 /* ------------------------------------------------------------
    Streaming: POST /v1/chat/completions with stream: true
    ------------------------------------------------------------ */
+let toolsEnabled = readStore("sushi-tools") === "on";
+function renderToolsButton() {
+  $("toolsButton").textContent = toolsEnabled ? "Tools on" : "Tools off";
+  $("toolsButton").setAttribute("aria-pressed", String(toolsEnabled));
+}
+$("toolsButton").onclick = () => {
+  toolsEnabled = !toolsEnabled;
+  writeStore("sushi-tools", toolsEnabled ? "on" : "off");
+  renderToolsButton();
+};
+renderToolsButton();
+async function callResearchTools(body, signal) {
+  const response = await api("/v1/tools", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify(body), signal,
+  });
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.error?.message ?? `Tools: ${response.status}`);
+  return result;
+}
 function wireMessages(history) {
   const out = [];
   const system = $("optSystem").value.trim();
@@ -1877,14 +1908,20 @@ function wireMessages(history) {
       const parts = images.map((url) => ({ type: "image_url", image_url: { url } }));
       if (message.content) parts.push({ type: "text", text: message.content });
       out.push({ role: "user", content: parts });
-    } else if (message.role === "assistant" && message.content) {
-      out.push({ role: "assistant", content: message.content });
+    } else if (message.role === "tool") {
+      out.push({ role: "tool", content: message.content, tool_call_id: message.tool_call_id });
+    } else if (message.role === "assistant" && (message.content || message.tool_calls?.length)) {
+      const entry = { role: "assistant", content: message.content || null };
+      if (message.tool_calls?.length) entry.tool_calls = message.tool_calls;
+      if (message.reasoning) entry.reasoning_content = message.reasoning;
+      out.push(entry);
     }
   }
   return out;
 }
-function buildRequest(model, history) {
+function buildRequest(model, history, tools = null) {
   const body = { model, messages: wireMessages(history), stream: true, stream_options: { include_usage: true } };
+  if (tools?.length) body.tools = tools;
   const effort = $("effortSelect").value;
   if (effort && effort !== "default") body.reasoning_effort = effort;
   const numeric = [
@@ -1953,9 +1990,10 @@ function replyMeta(usage, timings, finishReason, aborted, clientRate) {
   else if (finishReason === "length") parts.push("hit the token limit");
   return parts.join(" · ") || null;
 }
-async function streamReply(model, history, signal) {
+async function streamReply(model, history, signal, tools = null) {
   const view = createStreamingView();
   perfMon.begin();
+  const toolCalls = [];
   let usage = null;
   let timings = null;
   let finishReason = null;
@@ -1967,7 +2005,7 @@ async function streamReply(model, history, signal) {
       method: "POST",
       headers: { "content-type": "application/json" },
       signal,
-      body: JSON.stringify(buildRequest(model, history)),
+      body: JSON.stringify(buildRequest(model, history, tools)),
     });
     if (!response.ok) {
       let detail = await response.text();
@@ -2002,6 +2040,13 @@ async function streamReply(model, history, signal) {
         if (!choice) return;
         if (choice.finish_reason) finishReason = choice.finish_reason;
         const delta = choice.delta ?? {};
+        for (const part of delta.tool_calls ?? []) {
+          if (!Number.isInteger(part.index) || part.index < 0 || part.index >= 64) throw new Error("Invalid tool call index");
+          const call = toolCalls[part.index] ??= { id: "", type: "function", function: { name: "", arguments: "" } };
+          if (part.id) call.id += part.id;
+          if (part.function?.name) call.function.name += part.function.name;
+          if (part.function?.arguments) call.function.arguments += part.function.arguments;
+        }
         for (const [key, field] of [["reasoning_content", "reasoning"], ["content", "text"]]) {
           if (typeof delta[key] !== "string" || !delta[key]) continue;
           view[field] += delta[key];
@@ -2025,6 +2070,7 @@ async function streamReply(model, history, signal) {
   const seconds = firstAt ? (performance.now() - firstAt) / 1000 : 0;
   const clientRate = deltas > 1 && seconds > 0.05 ? deltas / seconds : 0;
   return {
+    tool_calls: finishReason === "tool_calls" && !signal.aborted ? toolCalls.filter(Boolean) : [],
     text: view.text,
     reasoning: view.reasoning,
     aborted: signal.aborted,
@@ -2032,8 +2078,40 @@ async function streamReply(model, history, signal) {
   };
 }
 function setChatBusy(busy) {
+  $("toolsButton").disabled = busy;
   $("sendButton").hidden = busy;
   $("stopButton").hidden = !busy;
+}
+async function runResearchTurn(model, messages, signal, tools, vision) {
+  for (let round = 0; round <= 8; round++) {
+    if (signal.aborted) return;
+    const result = await streamReply(model, messages, signal, round < 8 ? tools : null);
+    const calls = result.tool_calls ?? [];
+    if (calls.length && (!tools?.length || round === 8)) throw new Error("Unexpected tool call with tools disabled");
+    if (calls.some((call) => !call.id || !call.function?.name)) throw new Error("Incomplete tool call");
+    if (result.text || result.reasoning || calls.length) {
+      messages.push({ role: "assistant", content: result.text, reasoning: result.reasoning || null, meta: result.meta,
+        ...(calls.length ? { tool_calls: calls } : {}) });
+    }
+    if (!calls.length || result.aborted) return;
+    renderTranscript();
+    const images = [];
+    for (const call of calls) {
+      let output = { text: "Tool call cancelled" };
+      if (!signal.aborted) {
+        try {
+          if (!tools.some((tool) => tool.function.name === call.function.name)) throw new Error("Tool is not in the enabled pack");
+          output = await callResearchTools({ name: call.function.name, arguments: call.function.arguments, vision }, signal);
+        } catch (error) {
+          output = { text: signal.aborted ? "Tool call cancelled" : `Tool error: ${error.message}` };
+        }
+      }
+      messages.push({ role: "tool", tool_call_id: call.id, name: call.function.name, content: output.text });
+      if (output.image) images.push(output.image);
+      renderTranscript();
+    }
+    if (images.length) messages.push({ role: "user", content: "Images returned by the tools:", images, toolImages: true });
+  }
 }
 async function runTurn(chat) {
   const model = $("modelSelect").value;
@@ -2046,14 +2124,17 @@ async function runTurn(chat) {
   setChatBusy(true);
   renderTranscript();
   try {
-    const result = await streamReply(model, chat.messages, chatAbort.signal);
-    if (result.text || result.reasoning) {
-      chat.messages.push({ role: "assistant", content: result.text, reasoning: result.reasoning || null, meta: result.meta });
-    }
-    if (result.aborted) toast("Stopped", "ok");
+    const vision = modelSeesImages(selectedModel());
+    const pack = toolsEnabled ? await callResearchTools({ vision }, chatAbort.signal) : null;
+    if (pack) $("toolsButton").title = `Web search, page fetching and read-only files under ${pack.root}`;
+    await runResearchTurn(model, chat.messages, chatAbort.signal, pack?.tools, vision);
+    if (chatAbort.signal.aborted) toast("Stopped", "ok");
   } catch (error) {
-    lastTurnError = String(error.message ?? error).slice(0, 300);
-    toast("The reply failed", "err");
+    if (chatAbort.signal.aborted) toast("Stopped", "ok");
+    else {
+      lastTurnError = String(error.message ?? error).slice(0, 300);
+      toast("The reply failed", "err");
+    }
   } finally {
     chatAbort = null;
     setChatBusy(false);

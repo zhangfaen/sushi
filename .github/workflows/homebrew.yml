@@ -1,0 +1,47 @@
+name: Homebrew
+
+# Publishing a release moves beamivalice/homebrew-tap's Formula/sushi.rb to it right away; GitHub delays or skips
+# the tap's own hourly schedule, so it is only the fallback.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  bump-tap:
+    if: github.event_name == 'workflow_dispatch' || !github.event.release.prerelease
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      TAP: beamivalice/homebrew-tap
+      TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - name: Require the tap token
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::HOMEBREW_TAP_TOKEN is not set: a fine-grained token with Actions and Contents write on $TAP"
+            exit 1
+          fi
+
+      - name: Run the tap's bump
+        run: |
+          before=$(gh run list -R "$TAP" --workflow bump.yml --limit 1 --json databaseId --jq '.[0].databaseId // 0')
+          gh workflow run bump.yml -R "$TAP"
+          for _ in $(seq 1 30); do
+            id=$(gh run list -R "$TAP" --workflow bump.yml --limit 1 --json databaseId --jq '.[0].databaseId // 0')
+            [ "$id" != "$before" ] && break
+            sleep 5
+          done
+          [ "$id" != "$before" ] || { echo "::error::the tap's bump run never started"; exit 1; }
+          gh run watch "$id" -R "$TAP" --exit-status
+
+      - name: Confirm the formula names this release
+        run: |
+          tag="${TAG:-$(gh release view -R "$GITHUB_REPOSITORY" --json tagName --jq .tagName)}"
+          url=$(gh api "repos/$TAP/contents/Formula/sushi.rb" --jq .content | base64 -d | sed -n 's/^  url "\(.*\)"$/\1/p')
+          echo "formula url: $url"
+          case "$url" in
+            */download/"$tag"/*) ;;
+            *) echo "::error::Formula/sushi.rb still points at $url, not $tag"; exit 1 ;;
+          esac

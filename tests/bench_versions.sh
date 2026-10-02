@@ -87,7 +87,7 @@ RED='\033[0;31m'; GRN='\033[0;32m'; YEL='\033[0;33m'; DIM='\033[2m'; NC='\033[0m
 
 TARGETS=(
   # ── mimo_v2: sliding layers ring, so this is where the trim pays ──
-  "mimo-v2-flash-k2.5|${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.5bpw|--no-vision|EXL3 K2.5 experts, resident; sliding layers ring"
+  "mimo-v2-flash-2.3bpw|${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.3bpw|--no-vision|EXL3 K2.25 experts (last layer K4), resident; sliding layers ring"
   # ── qwen4_exp: hyper-connections + n-gram PLE + QSA; MTP is opt-in on MoE, forced like bench.sh ──
   "qwen38-flash-next-k3|${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw|--mtp|125B-A6B EXL3 K3, no sliding; in-checkpoint MTP head (opt-in), QSA past 2048"
 )
@@ -124,10 +124,11 @@ bin_for()   { [[ "$1" == "dev" ]] && echo "$DEV_BIN" || echo "$SHIPPED_BIN"; }
 bin_stamp() { stat -f "%Sm" -t "%Y-%m-%dT%H:%M" "$1" 2>/dev/null; }
 
 # ── Engine lifecycle ──
-# The kill list and the wait list must name the SAME port, or every stop burns
-# the full timeout (11 min/run when this was last broken).
+ENGINE_PID=""
 stop_engine() {
-    pkill -f "sushi --serve" 2>/dev/null
+    [[ -n "$ENGINE_PID" ]] || return 0
+    kill "$ENGINE_PID" 2>/dev/null; wait "$ENGINE_PID" 2>/dev/null
+    ENGINE_PID=""
     for _ in $(seq 1 40); do
         lsof -ti tcp:"$PORT" >/dev/null 2>&1 || return 0
         sleep 1
@@ -166,6 +167,7 @@ run_unit() {
     [[ -n "$spec" ]] && eval "spec_arr=($spec)"
     "$bin" --serve --model "$path" --port "$PORT" "${spec_arr[@]+"${spec_arr[@]}"}" >"$slog" 2>&1 &
     local pid=$!
+    ENGINE_PID=$pid
 
     local up=0
     for _ in $(seq 1 900); do
@@ -234,6 +236,11 @@ echo "  run dir: $RUN_DIR"
 echo "  depth:   $([[ $FULL -eq 1 ]] && echo '--full (median of 3/rung, to 64k)' || ([[ $QUICK -eq 1 ]] && echo '--quick (8k rung, one run)' || echo 'one run/rung, to 16k'))"
 echo "  pause:   touch $RUN_DIR/PAUSE"
 echo
+
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass --port" >&2
+    exit 1
+fi
 
 idx=0
 for t in "${TARGETS[@]}"; do

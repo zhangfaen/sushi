@@ -73,8 +73,10 @@ echo "  drafter: $([ "$USE_DRAFTER" = "1" ] && echo "$DRAFTER" || echo "(none)")
 echo "  turns:   $N_TURNS"
 echo
 
-pkill -f "sushi.*--port $PORT" 2>/dev/null || true
-sleep 1
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    exit 1
+fi
 
 LOGFILE=$(mktemp)
 "$BINARY" --model "$MODEL" --serve --port "$PORT" --pld "${DRAFTER_ARGS[@]}" > "$LOGFILE" 2>&1 &

@@ -189,8 +189,8 @@ Server log `~/.sushi/logs/sushi-<port>.log` is THE post-mortem file (`--log-leve
 `jinja error:`, `[cache]`, `<- N+M tokens`, `tool_msgs=`, `[spec-stats]`, `[mtp-planner]`, `[mtp-trace]`,
 `[loop-stop]`, `[admission]`, `[kv-cache]`, `[expert-stream]`, `[disk-cache]`, `[hot-cache]`, `[dtype-trace]`,
 `[short-gen]`. Capture traffic: `SUSHI_RAW_DUMP_FILE=<abs>` → `tests/harvest_tool_traffic.py`. Reproduce tool bugs
-`stream:false` first; `pkill -x sushi` between KV-poison tests. `/props` reports `active_bytes`,
-`memory.cache_bytes`, `batching`; RSS is blind to Metal.
+`stream:false` first; between KV-poison tests stop your own server by PID, never `pkill`. `/props` reports
+`active_bytes`, `memory.cache_bytes`, `batching`; RSS is blind to Metal.
 
 <a id="team-process"></a>
 ## Team process

@@ -13,7 +13,7 @@
 # accept any answer that names what is there.
 #   MIMO_MEDIA_MODEL=<pack> ./tests/test_mimo_media.sh [port]
 set -u
-MODEL="${MIMO_MEDIA_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.5bpw}"
+MODEL="${MIMO_MEDIA_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.3bpw}"
 PORT="${1:-11431}"
 BIN="${SUSHI_BIN:-./zig-out/bin/sushi}"
 RUNS="$HOME/.sushi/runs/mimo-media"

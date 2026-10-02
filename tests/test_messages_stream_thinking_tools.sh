@@ -48,8 +48,10 @@ if [ ! -d "$MODEL" ]; then
     exit 0
 fi
 
-pkill -f "sushi.*--port $PORT" 2>/dev/null
-sleep 1
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    exit 1
+fi
 "$BINARY" --model "$MODEL" --serve --port "$PORT" --ctx-size 8192 --log-level info > /tmp/test_messages_stream_thinking_tools.log 2>&1 &
 SERVER_PID=$!
 trap 'kill $SERVER_PID 2>/dev/null' EXIT

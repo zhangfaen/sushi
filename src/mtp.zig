@@ -839,13 +839,8 @@ pub const MtpModel = struct {
     /// SUSHI_MTP_DRAFT_HEAD_BITS: absent → 3 (default on)
     /// a supported bit width → that; anything else ("0", "off") → disabled.
     fn draftHeadBitsFromEnv() u32 {
-        const p = std.c.getenv("SUSHI_MTP_DRAFT_HEAD_BITS") orelse return 3;
-        const raw = std.mem.span(p);
-        const v = std.fmt.parseInt(u32, raw, 10) catch return 0;
-        return switch (v) {
-            2, 3, 4, 6, 8 => v,
-            else => 0,
-        };
+        const p = std.c.getenv("SUSHI_MTP_DRAFT_HEAD_BITS");
+        return draftHeadBitsFrom(if (p) |v| std.mem.span(v) else null, 3);
     }
 
     fn buildDraftHead(self: *MtpModel, target: *Transformer) !void {
@@ -1004,6 +999,15 @@ pub const MtpModel = struct {
 /// disagrees with the build reads a different vocab entirely.
 pub fn rerankCoarseBits() u32 {
     return MtpModel.draftHeadBitsFromEnv();
+}
+
+/// SUSHI_MTP_DRAFT_HEAD_BITS as read against a head family's unset default.
+pub fn draftHeadBitsFrom(raw: ?[]const u8, default: u32) u32 {
+    const v = std.fmt.parseInt(u32, raw orelse return default, 10) catch return 0;
+    return switch (v) {
+        2, 3, 4, 6, 8 => v,
+        else => 0,
+    };
 }
 
 /// Group size every coarse head is packed at.
@@ -5496,6 +5500,16 @@ test "mtp: a suppressed id is never drafted, through the coarse shortlist or the
     const full = try fullReadoutArgmax(s, &fx.xfm, x, mask);
     defer _ = mlx.mlx_array_free(full);
     try testing.expect((try readIdScalar(full)) != want);
+}
+
+test "mtp: coarse draft width is the env's when set, else the family default; an unreadable value turns it off" {
+    try testing.expectEqual(@as(u32, 3), draftHeadBitsFrom(null, 3));
+    try testing.expectEqual(@as(u32, 2), draftHeadBitsFrom(null, 2));
+    try testing.expectEqual(@as(u32, 3), draftHeadBitsFrom("3", 2));
+    try testing.expectEqual(@as(u32, 4), draftHeadBitsFrom("4", 2));
+    try testing.expectEqual(@as(u32, 0), draftHeadBitsFrom("0", 2));
+    try testing.expectEqual(@as(u32, 0), draftHeadBitsFrom("off", 2));
+    try testing.expectEqual(@as(u32, 0), draftHeadBitsFrom("5", 3));
 }
 
 test "mtp: rerankCoarseBytes prices the packed weights AND both bf16 group tables" {

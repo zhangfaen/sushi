@@ -22,9 +22,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 
 Any qwen4_exp checkpoint whose routed experts are leading-index banks streams: the HF fused bf16 layout
 (`mlp.experts.gate_up_proj` `[512,1280,2560]` + `down_proj` `[512,2560,640]`, 335 GB total, `streaming_required`),
-or the MLX split layout (`switch_mlp.{gate,up,down}_proj.{weight,scales,biases}`). An EXL3 pack serves resident
-only: `ModelConfig.streamsExperts` is false for it, so an SSD budget or expert cache asked of one is ignored with the
-non-streaming warning. MiMo's original MXFP4 checkpoint streams too ([arch-mimo-v2](arch-mimo-v2.md)). Trunk + MTP resident; routed experts come from SSD through
+or the MLX split layout (`switch_mlp.{gate,up,down}_proj.{weight,scales,biases}`), or a uniform Sushi EXL3 pack: its
+nine banks per layer (trellis, suh, svh per projection) stream through the same slabs and the resident EXL3 kernels
+run on slab-local ids, output bit-identical to resident; the ledger bills from the stored headers, a slot sized to
+the widest layer rate. A MiMo EXL3 pack streams the same way beside its FP8 trunk. Rate-group (`.gN`) and pruned
+packs are refused by name and serve resident until their streaming lands. MiMo's original MXFP4 checkpoint streams too ([arch-mimo-v2](arch-mimo-v2.md)). Trunk + MTP resident; routed experts come from SSD through
 zero-copy slabs. With no budget a pack loads resident as before.
 
 ## Budget
@@ -34,6 +36,9 @@ zero-copy slabs. With no budget a pack loads resident as before.
   per-layer LRU. `--expert-cache-gb` overrides (decimal GB of expert cache).
 - Precedence: `--expert-cache-gb` > `--ssd-budget-gb` > setting > `ExpertStreamingRequired` 503 naming all three.
   An explicit launch flag always beats `model-settings.json` ([server-lifecycle](server-lifecycle.md#settings)).
+- The load's fit check prices serving at the per-request ladder's floor rung (512), since a request picks its own
+  rung against free memory; a pinned chunk is priced as given; an explicit
+  `--prefill-chunk` only lowers the floor the load proves.
 - Admission `budget + planned KV <= wired limit`; the refusal names the `iogpu.wired_limit_mb` that would admit.
   Under `--no-mtp` the head is not loaded at all.
 - An imatrix capture's accumulators live in GPU headroom that admission reads: budgets for capture runs drop
@@ -50,6 +55,45 @@ zero-copy slabs. With no budget a pack loads resident as before.
 - **Load-time cache warm**: preload the lowest expert IDs into `floor(0.8 * slots_per_layer)` slots per MoE layer
   before kernel warmup and readiness, within the existing budget. These are ordinary LRU entries, not predicted
   routes; dense prefix layers are skipped.
+
+## Decode schedule
+
+- A streamed layer is latency-bound: one GPU→host read of the router ids per layer. The layer's expert compute is
+  submitted with `mlx_async_eval` as soon as it is built, and at decode widths (<= 16 rows) the shared expert is
+  submitted between the ids and the blocking read, so the GPU runs it during the host round trip. Same ops, same
+  order; output is bit-identical.
+- At decode widths each layer's experts are queued from a GPU copy of the cache map (`Engine.specRoute`: expert →
+  slot, -1 where not ready) before the host reads the router ids. The host keeps that result only when every routed
+  id resolved to the slot the GPU gathered (`specMatches`), else rebuilds it; a union workspace always rebuilds. The
+  host map and its GPU copy change together (`LayerState.refreshSpec`), or a stale GPU map could pass the check.
+- Qwen4 single-token decode keeps at most one unresolved layer while submitting the next GDN MoE layer's router
+  and cache-map expert compute. A cache miss discards that successor, restores its recurrent handles, and rebuilds
+  from the preceding MLP's exact output; PLE and full-attention successors verify first. Cache resolution and its
+  accounting occur only after the predecessor passes, so discarded routes never fill or touch LRU state.
+- Deferred HC writes belong to the speculative stream: rollback restores the preceding MLP's stream and injection
+  gate, then replaces the pending write with its exact result. Rollback transfers the saved HC handle, so a later
+  MLX error leaves one valid cleanup owner. Profiling, dtype tracing, layer captures, stand-ins,
+  imatrix collection and batched/wide forwards keep synchronous verification; a lossy pick defers only when the
+  GPU made it (below).
+- `SUSHI_EXPERT_DEFER_SYNC=1` selects synchronous verification for an exact schedule comparison: deferred
+  verification overlaps host work on hits but spends an extra GDN build and speculative compute on misses.
+
+## Lossy expert pick (`--expert-pick-tolerance <n>`, 0..0.6, default 0 = exact)
+
+- On a cache miss at decode widths, a routed expert may be replaced by the best cached expert outside the row's top-k
+  when its router probability is at least `(1-n)` times the missed one's (`ln(1-n)` on the logit difference). The substitute keeps the
+  missed expert's routing weight. `expert_stream.substituteMisses`; skipped under imatrix capture.
+- A sigmoid router (MiMo) feeds the pick log sigmoid(logit), unbiased (its correction bias only selects), so the
+  same gap test reads sigma_sub >= (1-n) sigma_miss (`routerSwapLogits`; -logaddexp(0, -x), finite where sigmoid
+  underflows). A raw sigmoid logit gap is not a probability ratio.
+- A row's expert is swapped at most `PICK_STARVE_LIMIT` (3) times in a row, then fetched, so a hot expert cannot stay
+  out of the cache. Misses are taken in descending logit order, and a missed expert another row is already fetching
+  counts as loading, not as a swap target.
+- At one-row decode the pick runs on the GPU (`expertPickGpu`, the same algorithm as `substituteMisses`, fed the
+  layer's map and starvation counts) and the experts are queued from its slots; the picked ids ride the ids' command
+  buffer. The host still makes its own pick and keeps the GPU result only when both agree.
+- Output depends on cache state, so it is not reproducible across runs or prompt histories. `kld capture` refuses a
+  non-zero tolerance: the teacher is exact routing. Numbers: [quality-kld](quality-kld.md#lossy-expert-pick).
 
 ## I/O
 

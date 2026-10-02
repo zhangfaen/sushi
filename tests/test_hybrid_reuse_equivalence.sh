@@ -33,9 +33,10 @@ BASE="http://127.0.0.1:$PORT"
 [ -x "$BIN" ]   || { echo "fail: build sushi first"; exit 1; }
 command -v jq >/dev/null || { echo "needs jq"; exit 1; }
 
-# Ensure no other server is running on the port.
-pkill -9 -f "sushi.*port $PORT" 2>/dev/null
-sleep 1
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or set PORT" >&2
+    exit 1
+fi
 
 LOG="$(mktemp)"
 SERVER_PID=""   # seeded: the EXIT trap runs on the SKIP path too, before any server starts

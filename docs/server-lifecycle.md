@@ -74,6 +74,12 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 ## What loads
 
 - A rescan makes a failed load retryable only when discovery finds the same ID at the same path; it clears the error and refreshes the on-disk byte count without disturbing live entries.
+- A qwen4_exp load that fails after the n-gram state or the MTP head exists frees both (`Qwen4Mtp.deinit`; the
+  state's `deinit` joins the table's warm thread first). Guard: the `QWEN4_TEST_MODEL` FailingAllocator sweep over
+  `loadQwen4Mtp`.
+- A streamed load that fails after its expert engine exists deinits it (`initExpertStream`, both archs): freed
+  alone, its I/O workers ran on in freed memory. Guard: a FailingAllocator sweep over `initExpertStream` with the
+  imatrix collector armed.
 
 - **Bind**: `server.resolveBind` defaults to `127.0.0.1:12345`; `--host` takes an IPv4 literal, `0.0.0.0` or
   `localhost` (= 127.0.0.1; anything else is refused by name, never widened). Before any model loads,
@@ -91,6 +97,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - Discovery (`src/model_discovery.zig` / `src/model_registry.zig`): two-level org/name, multi-root, streaming stubs,
   multi-model registry. **`--model-dir` is REPEATABLE** (`discoverModelsMany` merges roots FIRST-WINS). One path never
   registers under TWO ids (`registry.peekByPath`).
+- **The auto `--max-resident-mem` (80% of the GPU working-set limit) bounds CO-RESIDENCE only**: a cold load evicts
+  every other model first, and one that then loads alone is the load preflight's call (`mem_cap_binds_alone`); an
+  explicit `--max-resident-mem` binds a sole model too. Before this the 2.3bpw MiMo pack could not cold-load through
+  `/v1/load-model` (the app's path) on a 128 GB Mac at default flags.
 - **A reload FREES the CPU state `unloadResident` retains** while the entry is `.loading` (`releaseRetainedCpuState`):
   a reader holding no refcount takes the mutex AND skips them while `.loading`.
 
@@ -99,7 +109,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 
 - **An explicit launch flag outranks `model-settings.json`**, which outranks the default (`model_settings.pick`;
   `--ctx-size 0` = not given). Applies to `--mtp/--no-mtp`, `--kv-quant`, `--ctx-size`, `--mtp-typical/--mtp-tokenv3`,
-  `--mtp-greedy-tail`, `--ssd-budget-gb/--expert-cache-gb`, `--preserve-thinking`; a request's own field still applies on top. Design reviews reject "file beats
+  `--mtp-greedy-tail`, `--ssd-budget-gb/--expert-cache-gb`, `--preserve-thinking`, `--think-penalty`, `--logit-bias-file`; a request's own field still applies on top. Design reviews reject "file beats
   flag".
 - **`--fast` is a flag profile, ranked between the flags and the file**: an explicit flag > `--fast` >
   `model-settings.json` > the default, per key (`model_settings.pickLaunch`; the one table is
@@ -115,9 +125,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - `[pld] on|off (source)` and `/props settings.pld` report what a slot runs (`server.pldReport`): a module-wired arch
   (qwen4_exp) reads `off (module spec wiring)` whatever `--pld` says, since `scheduler.specInitWiring` never runs it.
 - Per-model settings live in `~/.sushi/model-settings.json` (`src/model_settings.zig`: `ctx_size`, `kv_quant`,
-  `mtp`, `mtp_acceptance`, `mtp_greedy_tail`, `ssd_budget_gb`, `preserve_thinking`), stamped at BOTH load construction sites and resolved
+  `mtp`, `mtp_acceptance`, `mtp_greedy_tail`, `ssd_budget_gb`, `preserve_thinking`, `think_penalty`, `logit_bias_file`), stamped at BOTH load construction sites and resolved
   ONCE in `doLoadOnInferenceThread` (`preserve_thinking` per render, where a request can override it, and logged as
-  `[chat] preserve_thinking on|off (source)` at load); read via `server.manualContext(config)` / `configuredKvQuantFor(config)`, never the raw
+  `[chat] preserve_thinking on|off (source)` at load; `think_penalty` per request, logged as
+  `[think-penalty] lambda L (source)`); read via `server.manualContext(config)` / `configuredKvQuantFor(config)`, never the raw
   server config.
 - A new per-model setting or launch flag follows this order, carries an `*_explicit` bit through both load sites and
   cold loads, and logs its resolved value with its source at load.
@@ -129,6 +140,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   budget revise.
 - Text slots BATCH-decode on `qwen4_exp` (`configBatchesDecode`); `--max-concurrent` sizes the submit queue. A
   batched group is capped by PADDING WASTE (`batchedKvKeepCount`, `MAX_PAD_WASTE` 1.5 < 2.0), not slot count.
+  Resident MiMo batches plain slots as rows of one forward, capped by `batchGroupCap` (4) with no padding
+  ([arch-mimo-v2](arch-mimo-v2.md#batched-decode)).
 - A cold prefill YIELDS to decode ticks at chunk boundaries (`scheduler.interleaveDecodeTick`;
   `SUSHI_PREFILL_INTERLEAVE=0` restores). Greedy byte-identical.
 - `--prefill-decode-share S` (flag > `SUSHI_PREFILL_DECODE_SHARE` > 0) targets the fraction of wall time given
@@ -150,10 +163,17 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 
 - Detach every per-connection `std.Thread` immediately; on teardown drain conn threads before `scheduler.deinit`.
 - Sleep inhibition follows the inference-thread wait.
+- **The first GPU submission after about a second of idle waits 0.6-1.0 s before any work runs** (M5 Max, MiMo
+  2.3bpw, ~90 GB resident, measured on e2d5be76; even a one-element op pays it, and a tick every 2 s does not prevent
+  it; [perf-baselines](perf-baselines.md#mimo-ttft-idle)). For `--gpu-warm-secs` (default 60, 0 = off) after its
+  last prefill or decode tick, the parked inference thread runs one synced element-op every 500 ms (`gpuWarmTick`),
+  never while work is queued; an unload closes the window. Output is unchanged.
 - `Slot.deinit` runs on conn threads: it stores marks, the inference thread frees.
 - A request's sampling state (`think_bound`, `constraint`) lives in its handler's frame: `complete` waits out any
   inference pass holding the slot (`Slot.in_pass`, taken under `queue_mu`) before the handler may free it.
   Guard: `tests/test_cancel_mid_tick.sh`.
+- **A slot whose prefill runs is in `Scheduler.prefilling`**, neither `pending` nor `decoding`, so a SIGTERM's
+  `cancelAllInFlight` stops it at the next chunk; it ran a MiMo 512k prefill on past 120 s until SIGKILL.
 
 ## Request ownership and media
 

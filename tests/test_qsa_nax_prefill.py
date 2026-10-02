@@ -37,11 +37,9 @@ for nonce in ('81492017', '52839106', '90371648'):
     assert usage.get('prompt_tokens_details', {}).get('cached_tokens', 0) == 0, usage
     answer = result['choices'][0]['message']['content']
     assert 'MAGNOLIA-7731' in answer, result
-    print(json.dumps({'arm': args.nax, 'usage': usage, 'answer': answer}), flush=True)
 log = args.log.read_bytes()[log_offset:].decode('utf-8', errors='replace')
 expected = ('[qsa-gather] engaged: sushi_qsa_nax_precise' if args.nax == 'on'
             else '[qsa-gather] engaged: sushi_attn_qsa256')
 assert expected in log, f'Missing engagement: {expected}'
 if args.nax == 'off':
     assert '[qsa-gather] engaged: sushi_qsa_nax_precise' not in log
-print('PASS: long prefill answers and expected QSA arm')

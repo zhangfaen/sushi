@@ -494,9 +494,9 @@ pub const NgramTable = struct {
 
     const WARM_CHUNK: usize = 8 << 20;
 
-    /// A raw bf16 table this box cannot hold: read by row, never warmed or claimed.
+    /// A table this box cannot hold (over half of RAM): read by row, never warmed or claimed.
     fn pastResidencyCap(self: *const NgramTable) bool {
-        return self.bits == 16 and self.map.len > ngramCacheLimit();
+        return self.map.len > ngramCacheLimit();
     }
 
     /// Call only at the table's final address; the warm thread retains `self`
@@ -621,7 +621,7 @@ pub const NgramTable = struct {
         const wide_ok = !wide or plePrefillPrefetchEnabled(kv_len, prefer_pool);
         // Announce the arm that actually runs, not the lever that permits it.
         const pooled = wide_ok and self.pool != null and self.fd >= 0 and need <= PrefetchPool.ROW_BUF;
-        const whole_chunk = wide and oversized_bf16;
+        const whole_chunk = wide and oversized_bf16 and self.bits == 16;
         if (wide) notePrefillGatherArm(pooled, row_ids.len, if (whole_chunk) row_ids.len else PrefetchPool.MAX_ROWS, prefillGatherWhy(wide_ok, pooled, prefer_pool));
         if (pooled and whole_chunk) {
             if (try self.pool.?.runBf16(self, row_ids, out)) return;
@@ -1463,6 +1463,10 @@ test "ngram prefill gather: 4096 rows through the pool equal the direct mmap rea
     try t.gatherChecked(dec, d_got, 0);
     try testing.expectEqualSlices(f32, d_ref, d_got);
     try testing.expectEqual(serial_warm_before, said(0, 0));
+    test_ngram_cache_limit = t.map.len - 1;
+    defer test_ngram_cache_limit = null;
+    try t.gatherChecked(ids, got, 0);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(ref), std.mem.sliceAsBytes(got));
 }
 
 test "ngram table: a bf16 .bin gathers rows from the mmap and through the pool" {
@@ -1611,7 +1615,7 @@ test "ngram table warm: touches the whole file in the background; close() joins 
     defer t4.close();
     try testing.expectEqual(@as(u32, 4), t4.bits);
     t4.startWarm();
-    try testing.expect(t4.warm_thread != null);
+    try testing.expect(t4.warm_thread == null);
 }
 
 /// A whole `ngram_table.bin` image in one page-aligned buffer. Caller frees with the page allocator.
@@ -1783,4 +1787,18 @@ test "WarmProgress emits on the byte step, on the silence timeout, and never twi
     try testing.expect(p.should(WARM_LOG_BYTES * 4, 14 * S));
     try testing.expect(!p.should(WARM_LOG_BYTES * 4 + 1, 15 * S));
     try testing.expect(p.should(WARM_LOG_BYTES * 5, 16 * S));
+}
+
+test "EXL3 streaming CPU oversized quantized PLE is not warmed or claimed" {
+    var f = try Bf16GatherFixture.init();
+    defer f.deinit();
+    f.table.bits = 4;
+    test_ngram_cache_limit = f.bytes.len - 1;
+    defer test_ngram_cache_limit = null;
+    warm_override = false;
+    defer warm_override = null;
+    const before = page_cache_claim.load(.acquire);
+    f.table.startWarm();
+    try testing.expectEqual(before, page_cache_claim.load(.acquire));
+    try testing.expect(f.table.warm_thread == null);
 }

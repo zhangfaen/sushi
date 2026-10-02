@@ -1,5 +1,5 @@
 #!/bin/bash
-# Usage: test_load_context_preflight.sh [resident Flash-Next pack] [port] [startup|cold] [--mtp|--no-mtp]
+# Usage: test_load_context_preflight.sh [resident Flash-Next or MiMo pack] [port] [startup|cold] [--mtp|--no-mtp]
 # Owns one GPU-lock run; checks warmup memory, not timing. Silent on success.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -22,7 +22,7 @@ assert mode in ("startup", "cold") and mtp in ("--mtp", "--no-mtp")
 if not (model / "config.json").is_file():
     print(f"SKIP: model not found: {model}", file=sys.stderr)
     sys.exit(0)
-assert json.loads((model / "config.json").read_text())["model_type"] == "qwen4_exp"
+assert json.loads((model / "config.json").read_text())["model_type"] in ("qwen4_exp", "mimo_v2")
 binary = Path(os.environ.get("SUSHI_BINARY", root / "zig-out/bin/sushi")).resolve()
 assert binary.is_file(), "build sushi with zig build -Doptimize=ReleaseFast first"
 out = Path(os.environ.get("RUN_DIR", Path.home() / ".sushi/runs" / f"load-context-{model.name}-{mode}-{mtp[2:]}"))

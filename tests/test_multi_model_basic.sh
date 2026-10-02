@@ -45,8 +45,10 @@ if [ ! -x "$BINARY" ]; then
     exit 1
 fi
 
-pkill -f "sushi.*--port $PORT" 2>/dev/null || true
-sleep 1
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    exit 1
+fi
 LOGFILE=$(mktemp)
 "$BINARY" --model-dir "$ROOT" --model "$ROOT/$M1" --serve --port "$PORT" --max-resident-models 4 ${SUSHI_TEST_EXTRA_ARGS:-} > "$LOGFILE" 2>&1 &
 SERVER_PID=$!

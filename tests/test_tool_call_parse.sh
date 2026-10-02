@@ -30,8 +30,10 @@ if [[ ! -x "$BINARY" ]]; then
     exit 1
 fi
 
-pkill -f "sushi --serve --port $PORT" >/dev/null 2>&1 || true
-sleep 1
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    exit 1
+fi
 
 LOG=$(mktemp)
 echo -e "${BLUE}=== Tool-call parse integration test ===${NC}"

@@ -23,10 +23,15 @@ BINARY="${BINARY:-./zig-out/bin/sushi}"
 [[ -d "$MODELS_ROOT" ]] || { echo "SKIP: root not found: $MODELS_ROOT"; exit 0; }
 [[ -d "$MODELS_ROOT/$LOADED_MODEL" ]] || { echo "SKIP: no checkpoint at $MODELS_ROOT/$LOADED_MODEL"; exit 0; }
 
-trap 'pkill -9 -x sushi 2>/dev/null; true' EXIT
+PID=""
+trap '[ -n "$PID" ] && kill -9 "$PID" 2>/dev/null; true' EXIT
+
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    exit 1
+fi
 
 # Test 1: --model + --model-dir → discovery enriches /v1/models
-pkill -9 -x sushi 2>/dev/null; sleep 1
 "$BINARY" --model "$MODELS_ROOT/$LOADED_MODEL" --model-dir "$MODELS_ROOT" \
     --serve --port "$PORT" --ctx-size 4096 --log-level warn \
     --no-warmup-eager > /tmp/test_disc.log 2>&1 &
@@ -91,8 +96,8 @@ if [[ "$sibling_bytes" -le 0 ]]; then
 fi
 echo "  PASS"
 
-pkill -9 -x sushi 2>/dev/null
-sleep 1
+kill -9 "$PID" 2>/dev/null
+wait "$PID" 2>/dev/null
 
 # Test 3: --model-dir alone (no --model) auto-selects first discovered
 echo "=== Test 3: --model-dir auto-select ==="
@@ -126,6 +131,6 @@ fi
 echo "  headless: 0 loaded, $stub_count stub(s) registered on demand"
 echo "  PASS"
 
-pkill -9 -x sushi 2>/dev/null
+kill -9 "$PID" 2>/dev/null
 echo
 echo "=== ALL DISCOVERY TESTS PASSED ==="

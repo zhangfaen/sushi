@@ -31,8 +31,11 @@ bad() { echo -e "  ${RED}FAIL${NC} $1"; shift; for l in "$@"; do echo "        $
 [ -f "$MODEL/config.json" ] || { echo "SKIP: no config.json at $MODEL"; exit 0; }
 [ -x ./zig-out/bin/sushi ] || { echo "FAIL: build first"; exit 1; }
 
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    exit 1
+fi
 LOG=$(mktemp /tmp/cancel_toolbuf.XXXXXX)
-pkill -f "bin/sushi" 2>/dev/null; sleep 1
 ./zig-out/bin/sushi --model "$MODEL" --serve --port "$PORT" --log-level debug > "$LOG" 2>&1 &
 SERVER_PID=$!
 cleanup() { kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null; rm -f "$LOG"; }

@@ -1,6 +1,7 @@
 # Architecture: MiMo-V2.6-Flash (`mimo_v2`)
 
-How the engine serves MiMo-V2.6-Flash-RL: the source checkpoint's layout, the resident trunk, the MXFP4 and EXL3
+How the engine serves MiMo-V2.6-Flash (the served pack is quantized from the MOPD release; the RL release shares its
+layout): the source checkpoint's layout, the resident trunk, the MXFP4 and EXL3
 expert paths, the hybrid global/sliding attention with its ring, the vision tower, and the bills that follow the
 storage. MiMo serves text and image input; the supported product is the MCG EXL3 pack. Read this before touching
 `src/mimo_source.zig`, `src/mimo_vision.zig`, the MiMo arms of `src/transformer.zig`, or anything that bills MiMo's KV.
@@ -12,8 +13,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 
 ## Product policy
 
-- **MCG EXL3 only.** The served MiMo target is the K2.25 MCG EXL3 pack
-  (`MiMo-V2.6-Flash-Sushi-2.25bpw`).
+- **MCG EXL3 only.** The served MiMo target is the MCG EXL3 pack `MiMo-V2.6-Flash-Sushi-2.3bpw` (K2.25 experts,
+  the last layer K4).
 - **Thinking defaults ON** (the vendor template's default; `generation_config.json` declares none); effort words
   only set the thinking budget (see [server-http-apis](server-http-apis.md)).
 
@@ -38,7 +39,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 
 - **Original checkpoint**: `.mxfp4_individual` streams per-expert U8 payloads directly into U32 slabs without
   changing bytes. The FP8 trunk (`qkv_proj`, layer-0 MLP) stays resident AS STORED: e4m3 codes + f32 128x128
-  tile scales, served by `fp8_block.zig` (f32 decode GEMV for 1-4 rows, staged x for 5-16, one linear dequantized to
+  tile scales, served by `fp8_block.zig` (f32 decode GEMV for 1-8 rows, staged x for 9-16, one linear dequantized to
   billed bf16 scratch + MLX matmul for wider forwards). That is the checkpoint's exact math, so the KLD teacher
   carries no quantization of its own ([quality-kld](quality-kld.md#teacher-path)); sources are read-only, MTP/media
   excluded, residency billed as stored plus `server.fp8DequantScratchBytes` at prefill. All three kernels are plain
@@ -51,6 +52,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   rank-local tiles, not trailing padding on the full tensor. Tensor-parallel 4 is solved from geometry.
 - **A MiMo EXL3 pack serves RESIDENT**: see [engine-exl3-experts](engine-exl3-experts.md#mimo). The trunk takes
   the source loader (`usesMimoSourceTrunk`), billed as stored by `mimoSourceResidentBytes`.
+- **A load holds ONE 2-bit coarse copy of the lm_head** (`Transformer.lm_head_coarse`, ~0.19 GB, billed with or
+  without MTP, `scheduler.mimoCoarseHeadBytes`): the heads draft on it and the trunk's greedy readout shortlists on it,
+  so a greedy argmax is the same with MTP or without ([engine-mtp](engine-mtp.md#greedy-shortlist)). A streamed load
+  keeps it too, billed as trunk in the SSD budget ledger.
 - **The weight loader is ONE decision** (`model.loadWeightsForConfig`): a MiMo pack read without its source trunk
   binds the raw FP8 fused QKV and its logits stop following the routed experts (two packs sharing a hard-linked
   trunk produced bit-identical logits until `kld` took the served loader).
@@ -70,14 +75,16 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   presence follows the layer type (sliding layers only).
 - mlx-lm's MiMo support (upstream PR 1219) agrees with this engine on every mechanism except that it computes the
   router matmul in bf16 (changes the top-8 set for 2.8% of tokens per layer; patch it to f32 before using it as a
-  cross-check). `attention_chunk_size` is read by nothing in the engine; whether the reference's chunked attention
-  differs from a plain sliding band is an open question.
+  cross-check). `attention_chunk_size` is read by nothing, in the engine or the reference: `modeling_mimo_v2.py`
+  masks a sliding layer with transformers' `create_sliding_window_causal_mask`, a query and the 127 keys before it,
+  which the `mimo v2 fixture` parity test pins across the window edge.
 
 ## Expert streaming and imatrix
 
 - `first_moe_layer` preserves absolute layer indices while excluding dense prefix layers from expert slabs and cache
   budgets. MXFP4 has six operands in nine stable component slots; absent biases acquire no slab or lease. MTP
-  remains refused while streaming. Streaming engine: [engine-expert-streaming](engine-expert-streaming.md).
+  remains refused while streaming; `--expert-pick-tolerance` compares the router's sigmoid probabilities.
+  Streaming engine: [engine-expert-streaming](engine-expert-streaming.md).
 - **Imatrix** keys by ARCH (`imatrix.Arch.mimo_v2` → `model.layers.{L}.mlp.experts.*`, one flat entry per layer) and
   reaches the streamed QUANTIZED layer through the routing override's tap; armed, it forces the SORTED expert arm —
   the fused decode kernels never materialize the activation rows the down statistic needs. The driver lives in the
@@ -94,21 +101,26 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   never the context.
   A non-zero `max_seq` into `KVCache.update` IS the ring predicate, so `slidingViewFor` may never decline the trim
   on a ringed arch.
+- **A compaction lets go of the pre-compaction buffer when the forward that read it is evaluated**
+  (`KVCache.handOffRingViews`, `ringCompact`): the forward takes the entry's views, the entry re-points at its ring,
+  and the ring is evaluated at once. Left lazy, the ring and the views pinned every sliding layer's staged chunk until
+  the next forward, 39 layers where `swaStreamBytesPerToken` bills the eval cadence's 5.
 - **A ringed entry's `offset` is LOCAL**; absolute = `base + offset` (`absSeqLen`). A clamp below the retained
   window declines by NAME (`SlidingRingRewindPastWindow`) and the hot-cache restore cold-prefills; a byte-budget trim
   lands only at the entry's end or a ring checkpoint ([engine-prefix-cache](engine-prefix-cache.md#candidate-ranking-and-trimming)).
 - **The SSD tier persists a ringed entry as chunks of the global layers plus one ring file per restore point**
-  (`r{pos}.safetensors`: the prompt end, inherited forks, the entry's end) and restores only at one of them
+  (`r{pos}.safetensors`: the prompt end, message marks, inherited forks, the entry's end) and restores only at one of them
   (`restoreIntoRinged`, manifest v9); a ringed slot never takes an entry without them (its sliding layers are billed
   as the ring, so a full prefix there would be unbilled).
 - **A hot entry keeps a prompt-end ring checkpoint** (window + 30 rows per sliding layer): a reply past ~256 tokens
   compacts the ring past the prompt end, and a client that sends back content only diverges at prompt + 1 (history
   renders `<think></think>` where the model wrote its thought; one that echoes `reasoning_content` matches the whole
   entry). The content-only reply re-prefills at its new positions; the restore keeps the conversation before it
-  ([engine-prefix-cache](engine-prefix-cache.md#basics)). `swaRingCheckpointBytes` bills each of the slot's two copies
-  beside the ring (at its restore and its prompt end; 158 rows: 30 MiB bf16, 16 MiB kv8, `server.slotRingBytes`);
-  each entry bills its own in `kv_bytes`, up to four with those it inherits from the entry it forked off
-  (`bestRingDonor`).
+  ([engine-prefix-cache](engine-prefix-cache.md#basics)). `swaRingCheckpointBytes` bills each of the slot's
+  `SLOT_RING_CHECKPOINTS` = 6 copies beside the ring (its restore, up to four message marks, its prompt end; 158
+  rows: 30 MiB bf16, 16 MiB kv8, `server.slotRingBytes`); each entry bills its own in `kv_bytes`, up to eight with
+  those it inherits from the entry it forked off (`bestRingDonor`). `slotRingBytes` also bills the global-layer
+  decode rebuilds the other rows of a batched decode hold below the packed arms' floor (`batchedDecodeRowsBytes`).
 - **A hot entry holds a ringed layer's RETAINED ROWS, never the ring's capacity** (`KVCache.snapshotRetained`): the
   buffer is allocated at `ringCap` from token one, so a plain share billed and pinned rows no restore can read.
 - Per token: bf16 288 KiB → 22.5 KiB, kv8 153 KiB → 12.0 KiB; ring per slot 122 MiB bf16, 65 MiB kv8.
@@ -123,6 +135,12 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   coordinates), never rebuilt whole; the sliding ring view is window + chunk rows, dequantized per view.
   Landed 2026-09-23 (668278c): 39-layer band attention 39.5 -> 20.3 ms at chunk 512, 603 -> 95.5 at 2048, 2439 -> 181
   at 4096; 16x512 KLD -0.2%, inside the rounding-flip floor.
+- **Global-layer attention is what grows a long prompt's TTFT**: ~26% of it at 64k, ~43% at 128k and ~62% at 256k at
+  chunk 2048; the band calls are ~1% ([perf-baselines](perf-baselines.md#mimo-longctx-prefill-attn)).
+- **A global-layer forward under 16 rows runs row by row** (`MimoAttnArm.prefill_rows`, the verify rows' arm): the
+  fused kernel declines there, and the composed arm would rebuild the whole packed cache dense beside a
+  [heads, rows, keys] score sheet, unbilled. A warm restore's short tail (a follow-up of a few tokens) is the case;
+  each row is its serial decode tick bit for bit.
 - **On M5 both layer kinds prefill on the matrix units** (`sushi_attn_pd_nax`, same carries, bill and slices;
   `SUSHI_ATTN_PD_NAX=0` = the SIMD kernel): global attention ~3x faster per layer
   ([engine-kernels](engine-kernels.md#prefill-kernels), [perf-baselines](perf-baselines.md#mimo-attn-kernels)).
@@ -151,8 +169,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - QKV is ONE FP8 GEMV per layer with three outputs (`fp8_block` `gemv3`); V leaves it already multiplied by
   `attention_value_scale` (`RowSplit.v_scale`, rounded to the output dtype first, as the composed multiply did).
 - The GEMV's three width arms REASSOCIATE the f32 sum, so a row is byte-identical to a decode tick only at or below
-  `MIMO_VERIFY_ROWS_MAX`: direct (<=4 rows) strides each row in 16-byte chunks per lane, staged x (5-16) gives each
-  lane one 4-column group per 128-column tile, and the wide arm (>=17) dequantizes the weights to bf16.
+  `MIMO_VERIFY_ROWS_MAX`: direct (<=8 rows) strides each row in 16-byte chunks per lane, staged x (9-16) gives each
+  lane one 4-column group per 128-column tile, and the wide arm (>=17) dequantizes the weights to bf16. Past four
+  rows the direct arm runs two stored rows per simdgroup (8 per group), which moves no row's sum and beat the staged
+  arm by 23-36% at 8 rows on every FP8 trunk shape ([perf-baselines](perf-baselines.md#mimo-verify-8)).
 - Every residual add runs in one kernel with the norm that reads its sum (`fusedAddRmsNormUngated`): the
   post-attention norm (`fusedAddRmsNormRouted` also emits the f32 router input), the next layer's input norm and the
   final norm. The router is widened to f32 once at load (source-trunk packs), not per forward.
@@ -163,19 +183,39 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   removing all three families outright saved under 2% of a decode forward (79a4cb4, 4096 keys, one boot, arms
   interleaved), so fusing them is worth under 1%. The decode idle time is the dependent chain of heavy kernels.
 - An MLX custom kernel writes fresh outputs, never the cache in place; writing through an input buffer would bypass
-  MLX's hazard tracking and the copy-on-write the prefix-cache snapshots rely on. A fused rope + kv8 quantize was
-  bit-identical but never timed live, and is not in the tree.
+  MLX's hazard tracking and the copy-on-write the prefix-cache snapshots rely on.
+- **Any forward of up to `MIMO_VERIFY_ROWS_MAX` rows ropes Q/K and quantizes K/V in one dispatch on a kv8 cache**
+  (`mimoDecodeQkvPrep`, FP8 QKV only; decode, verify rows, short tails, the final prompt token): the kernel writes
+  fresh quantized rows and `KVCache.appendQuantized` appends them through the usual slice updates, so the ring, its
+  compaction and the packed-arm switch are untouched. Bit-identical to the composed rope + `quantizeAffine` (unit test
+  at MiMo shapes, both rope bases, 1-8 rows). It removes ~380 primitives from a decode forward;
+  `SUSHI_DECODE_FWD_UBENCH_QKV_PREP_ARMS=1` is its A/B.
 - A joined `[Q | K]` GEMV output with one rope over both passed its unit tests but moved live logits by ~0.05
   nats at the first token, cause unfound; it is not in the tree.
 
+## Batched decode
+
+- **Concurrent plain slots decode as rows of ONE forward** (`forwardMimoBatchedDecode`): the slots' next tokens
+  go through the verify-row path, whose every op but attention already computes a row as its decode tick does;
+  row i attends and appends on slot i's own cache at its own position through the solo core (`mimoAttnCore`,
+  `ForwardCtx.batch_rows`), so ring compaction and marks happen per slot as in a solo tick, and each row is read out
+  as its tick reads it (the shortlist under `argmax_only`). Byte-identical to the solo ticks (`mimo batched decode
+  rows` on the real pack; `tests/test_mimo_batched_equivalence.sh`).
+- A group holds at most four slots (`batchGroupCap`, independently of the MTP verify width); the rest decode serial by name
+  (`row_cap`). Nothing pads: rows never share a key tensor. Groups of three or four eligible MTP slots take
+  plain batched ticks and retain each row's hidden state so solo rounds can resume; smaller groups keep solo MTP.
+  `SUSHI_MTP_BATCHED=0` disables this MTP crowd policy.
+- Measured against interleaved MTP streams: [perf-baselines](perf-baselines.md#mimo-batched-decode).
+
 ## Prompt lookup decoding
 
-- **A PLD verify is MTP's verify** (`ctx.verify_rows`, drafts capped at `MIMO_VERIFY_ROWS_MAX` - 1 = 3): every
+- **A PLD verify is MTP's verify** (`ctx.verify_rows`, drafts capped at `MIMO_VERIFY_ROWS_MAX` - 1 = 7): every
   row reads the packed cache as its own decode tick would, a partial accept truncates, and no `KVCache.snapshot` is
   taken, so greedy PLD is serial byte for byte. The prefill-shaped verify it replaced declined the fused kernel below
   16 rows, rebuilt every global layer's whole cache dense, copied the cache on every write under the snapshot and
   re-forwarded partial accepts.
-- MTP outranks PLD (`server.requestSpecModes`), so PLD runs only on requests without MTP.
+- MTP outranks PLD (`server.requestSpecModes`), so PLD runs only on requests without MTP; an MTP request copies its
+  context through prompt lookup inside the round instead ([engine-mtp](engine-mtp.md#lookup)).
 - PLD stays on by default: it pays on echo workloads (a code edit that echoes the context). The prompt n-gram gate
   passes ordinary prompts too (score 0.16-0.32 against 0.01), so the runtime yield and per-draft gates are what bound
   the loss on text that does not echo.
@@ -229,14 +269,30 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   `server.kvDequantScratchBytes` bills the kv-quant dense rebuild as ONE layer at the rows that layer stores.
 - `mimo_source.countResidentBytes` bills each MoE router twice: as stored (bf16) and as the f32 copy the
   transformer loader keeps (~0.2 GB on the Flash pack).
+- **With a disk tier, a request bills a restored global layer beside its first grow** (`server.growCoexistBytes`): an
+  SSD restore installs each global layer at exactly the restored rows, and the first append grows it while the
+  restored buffer is alive. The admission never sees the restore, so it bills one eval window of that at the prompt's
+  length (one global layer: 0.54 GB at 400k, kv8).
 - **The prefill chunk is chosen per request** (`perRequestPrefillChunk` covers a ringed arch): the widest rung up
-  to 4096 whose admission bill fits live memory. The ungated load-time pin subtracts the hot-cache ask first and
-  pinned 2048 (512 before the fused sliding prefill) at every context.
+  to 2048 whose admission bill fits live memory, which is 2048 at every context to 256k on a 128 GB Mac. An
+  explicit `--prefill-chunk` caps the ladder and may raise the default as far as the 4096 ceiling
+  (`boundedPrefillChunk`). At 64k the two widths prefill within ~2% of each other
+  ([perf-baselines](perf-baselines.md#mimo-longctx-prefill-attn)), but their bytes differ, so the output of a
+  prompt longer than 2048 tokens depends on the width memory allowed. The ungated load-time pin subtracts the
+  hot-cache ask first and lands on 512, 1024 or 2048 with the memory active at load. It is only the fallback
+  (`SUSHI_PREFILL_CHUNK_PER_REQUEST=0`), and the load line says so.
+- **A MiMo prefill evicts the hot cache to be admitted** (`admissionEvictsHotCache`): the warm credit is the restored
+  global rows only (`kvBytesPerToken` and `residentCapacityTokens` skip the ring), the ring and the slot's checkpoint
+  copies are billed whole every turn, and a shared or SSD restore credits nothing. Adaptive width and mid-prefill
+  stepping stay qwen4_exp-only.
 - **A ringed arch RESERVES its cache capacity up front** (`ModelConfig.reservesKvCapacity`, narrower than
   `longCtxGated`) and bills the reservation headroom and the ring: growing +25% at a time duplicated a global layer
   mid-prefill.
 - Admission bills at kv8: 64k 2.75 GiB, 128k 3.69, 512k 9.29 at chunk 512 (10.34 at 1024), 1M 16.76; 1M at kv8
   needs 12.83 GB of KV alone. An explicit `--ctx-size` outranks auto-context.
+- **Resident MiMo takes the wired-limit floor** (`iogpu.wired_limit_mb` minus `--wired-margin-gib`), as Flash-Next and
+  a streamed load do. Under the old footprint + free RAM ceiling, ~17 GiB of other apps' memory left 8.7 GiB and a
+  768k server refused a 140k prompt; at 120,000 MB the floor leaves ~16 GiB beside a 93 GiB resident MiMo.
 
 ## Evidence
 

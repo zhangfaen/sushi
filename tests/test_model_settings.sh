@@ -41,12 +41,13 @@ LOG="$FAKE_HOME/server.log"
 SRV=""
 cleanup() {
     [ -n "$SRV" ] && kill "$SRV" 2>/dev/null
-    pkill -f "sushi.*--port $PORT" 2>/dev/null
     rm -rf "$FAKE_HOME"
 }
 trap cleanup EXIT
-pkill -f "sushi.*--port $PORT" 2>/dev/null
-sleep 0.5
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    exit 1
+fi
 
 write_settings() { # write_settings <ctx> <kv>  — override for MODEL_A only
     cat >"$SETTINGS" <<JSON

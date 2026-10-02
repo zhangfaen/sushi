@@ -184,9 +184,10 @@ echo "  model: $MODEL"
 echo "  prompt: <echo-heavy code rename>"
 echo
 
-# Pre-emptively kill any stale server on the test port.
-pkill -f "sushi.*--port $PORT" 2>/dev/null || true
-sleep 1
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    exit 1
+fi
 
 OUT_NOPLD=$(run_request "without --pld" "--no-pld") || exit 1
 echo "  no-pld output captured ($(echo "$OUT_NOPLD" | wc -c) bytes)"

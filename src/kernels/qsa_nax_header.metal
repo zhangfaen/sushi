@@ -1,3 +1,4 @@
+#if QSA_PACKED
 // Copyright © 2025 Apple Inc. Adapted from MLX steel/attn/nax.h.
 // Only the cooperative fragments used by sparse attention are retained.
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -157,3 +158,13 @@ struct QsaMax { template<typename T> static T apply(T a,T b) { return metal::max
 struct QsaSum { template<typename T> static T apply(T a,T b) { return a+b; } };
 struct QsaMul { template<typename T> static T apply(T a,T b) { return a*b; } };
 struct QsaExpSub { template<typename T> static T apply(T a,T b) { return metal::exp2(a-b); } };
+#else
+#include <metal_stdlib>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace metal;
+#define UNROLL _Pragma("clang loop unroll(full)")
+constant int GQA = 12;
+constant int TOPK = 512;
+constant int PV_TERMS = 2;
+using PT = half;
+#endif

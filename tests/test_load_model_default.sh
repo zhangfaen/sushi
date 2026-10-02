@@ -22,7 +22,7 @@ BIN="$ROOT/zig-out/bin/sushi"
 
 MODELS_ROOT="${MODELS_ROOT:-$HOME/.sushi/models}"
 BOOT_MODEL="${BOOT_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw}"
-SWITCH_MODEL="${SWITCH_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.5bpw}"
+SWITCH_MODEL="${SWITCH_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.3bpw}"
 if [ ! -f "$BOOT_MODEL/config.json" ] || [ ! -f "$SWITCH_MODEL/config.json" ]; then
     echo "SKIP: needs two local chat models (BOOT_MODEL=$BOOT_MODEL, SWITCH_MODEL=$SWITCH_MODEL)"
     exit 0
@@ -46,12 +46,13 @@ LOG="$(mktemp)"
 SRV=""
 cleanup() {
     [ -n "$SRV" ] && kill "$SRV" 2>/dev/null
-    pkill -f "sushi.*--port $PORT" 2>/dev/null
     rm -f "$LOG"
 }
 trap cleanup EXIT
-pkill -f "sushi.*--port $PORT" 2>/dev/null
-sleep 0.5
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    exit 1
+fi
 
 "$BIN" --serve --model "$BOOT_MODEL" --model-dir "$MODELS_ROOT" --port "$PORT" --log-file off >"$LOG" 2>&1 &
 SRV=$!

@@ -52,8 +52,10 @@ if [ ! -x "$BINARY" ]; then
     exit 1
 fi
 
-pkill -f "sushi.*--port $PORT" 2>/dev/null || true
-sleep 1
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    exit 1
+fi
 
 LOGFILE=$(mktemp)
 echo "  starting server (--prefix-cache-entries 8 --prefix-cache-mem ${SHORT_BUDGET_MB}MB)..."
@@ -184,8 +186,9 @@ msgs = [{"role": "system", "content": "You are a terse assistant."}]
 for t in range(1, turns + 1):
     filler = " ".join(f"entry {t}.{i} value {(i * 7) % 97}" for i in range(words // 4))
     msgs.append({"role": "user", "content": f"Turn {t} log:\n{filler}\nAcknowledge in one sentence."})
-    body = json.dumps({"model": "sushi", "messages": msgs,
-                       "max_tokens": 16, "temperature": 0.0}).encode()
+    # Thinking off: a thinking model spends 16 tokens on reasoning and returns empty content.
+    body = json.dumps({"model": "sushi", "messages": msgs, "max_tokens": 16,
+                       "temperature": 0.0, "enable_thinking": False}).encode()
     req = urllib.request.Request(base + "/v1/chat/completions", data=body,
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=600) as r:

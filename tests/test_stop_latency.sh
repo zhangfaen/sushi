@@ -40,9 +40,11 @@ if [ ! -x "$BINARY" ]; then
     exit 1
 fi
 
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    exit 1
+fi
 LOGFILE=$(mktemp)
-pkill -f "sushi.*--port $PORT" 2>/dev/null || true
-sleep 1
 "$BINARY" --model "$MODEL" --serve --port "$PORT" > "$LOGFILE" 2>&1 &
 SERVER_PID=$!
 trap "kill $SERVER_PID 2>/dev/null || true; wait $SERVER_PID 2>/dev/null || true; rm -f $LOGFILE" EXIT INT TERM

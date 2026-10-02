@@ -16,6 +16,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   `arguments` ALWAYS valid JSON).
 - Serialization `chat.serializeMessagesJson`: role "tool" native, args as JSON STRINGS, every string via
   `appendJsonString`. Streaming: full args in ONE SSE delta, thinking → `reasoning_content`.
+- Buffered calls may exceed a client's inter-event progress deadline even while SSE keepalives arrive. The omp launcher
+  disables that deadline only for its Sushi provider; argument truncation and loop-stop rules remain unchanged.
 - **Hard invariants (replay-pinned)**: emitted args ALWAYS valid JSON; every converter escapes + dedups; coercion
   never worsens conformance; a parsed NAME never contains `<|`; no tag leaks. Harness:
   `src/tool_traffic_replay_test.zig` over `src/fixtures/tool_traffic.jsonl`.
@@ -53,6 +55,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   is read as a spec — pin it with a test.
 
 ## Parsing tool calls
+
+- Nameless calls are discarded; XML function names reject empty placeholders and whitespace or tag fragments from prose.
 
 - **A `<tool_call>` body carrying `<function=` is the XML dialect and is read FIRST** (qwen 3.5+ template mandates
   it); a parameter VALUE never decides the call. A `<parameter>` VALUE may spell the dialect's own close tags
@@ -105,9 +109,14 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   path (`.hold_thinking` + `unstreamedReasoning`, never a resend); the think gate scans with a CURSOR (`ThinkScan`).
 - Thinking-off is enforced in the PROMPT; generated reasoning is ALWAYS delivered (every site splits via
   `splitThinkBlock(text, true, …)`).
+- **A thought is decided at its first byte when no opener can start it** (`chat.thinkOpenerPossible`: every opener
+  starts with `<` or is a Muse `assistant` / `to=` header); otherwise the three stream sites wait for 7 bytes. On the
+  surface budget path (`armThinkBound` declined) the budget then counts from that earlier consumption.
 - **An open thought streams only what its closed split delivers** (`trim(thought, "\n ")`): a trailing `"\n "` run and
   a close tag still arriving wait (`chat.settledReasoning` on the tools path, `chat.openThoughtFlush` /
   `closedThoughtDelta` on raw flushes). Streaming the newline before `</think>` made stream and non-stream differ.
+- **A thought the length limit cuts ends on what its split delivers** (`chat.cutThoughtDelta`): a lone opener is
+  structure, and a thinking block or reasoning item opens at its first delta, so an empty thought streams none.
 
 ## Loop stops
 

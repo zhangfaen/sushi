@@ -18,8 +18,10 @@ BIN="${BIN:-./zig-out/bin/sushi}"
 
 run_arm() {
   local val="$1" out="$2"
-  pkill -f "sushi.*--port $PORT" 2>/dev/null
-  sleep 2
+  if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or set PORT" >&2
+    exit 1
+  fi
   if [ -n "$val" ]; then
     env "$VAR=$val" "$BIN" --model "$MODEL" --serve --port "$PORT" >/tmp/greedy-ab-$PORT.log 2>&1 &
   else

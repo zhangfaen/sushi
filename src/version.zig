@@ -13,7 +13,7 @@ const expert_exl3 = @import("sushi_exl3").format;
 /// A host that runs sushi as an out-of-process engine refuses a `guest_api` it does not know.
 pub const guest_api = 1;
 /// The model types a host may route to this release line.
-pub const guest_model_types = [_][]const u8{"qwen4_exp"};
+pub const guest_model_types = [_][]const u8{ "qwen4_exp", "mimo_v2" };
 
 /// The build facts `sushi --guest-manifest` reports (shipped as `guest.json` in the release tarball).
 pub const GuestPins = struct {
@@ -167,7 +167,8 @@ test "version: the guest manifest names the build's pins and the pack contract i
         \\  "mlx_c": "56b2d39",
         \\  "min_macos": "26.2",
         \\  "model_types": [
-        \\    "qwen4_exp"
+        \\    "qwen4_exp",
+        \\    "mimo_v2"
         \\  ],
         \\  "expert_quant": {
         \\    "format": "exl3",

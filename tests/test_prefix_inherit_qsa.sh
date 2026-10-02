@@ -102,8 +102,10 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-pkill -f "sushi.*--port $PORT" 2>/dev/null || true
-wait_port_closed || true
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    exit 1
+fi
 
 BASELINE_FREE_MB=$(free_mb)
 echo "  baseline free+inactive+speculative before any boot: ${BASELINE_FREE_MB} MB"

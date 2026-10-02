@@ -103,7 +103,8 @@ pub fn loadWeights(
         const meta = entry.value_ptr.*;
         switch (try classifyKey(key, config)) {
             .skipped, .fp8_scale => {},
-            .resident, .routed_expert => {
+            .resident, .routed_expert => |kind| {
+                if (kind == .routed_expert and config.expert_streaming) continue;
                 const raw = try readTensor(allocator, model_dir, meta);
                 defer allocator.free(raw);
                 var arr = try uploadDense(raw, meta, stream);
@@ -735,7 +736,8 @@ fn validateExl3Expert(key: []const u8, meta: TensorMeta, config: *const model.Mo
     const rest = ref.rest[bank_prefix.len..];
     const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return error.UnclassifiedMimoTensor;
     const proj = rest[0..dot];
-    const part = rest[dot + 1 ..];
+    const named = try @import("sushi_exl3").group_layout.Name.parse(rest);
+    const part = ([_][]const u8{ "trellis", "suh", "svh" })[named.part];
     const down = std.mem.eql(u8, proj, "down_proj");
     if (!down and !std.mem.eql(u8, proj, "gate_proj") and !std.mem.eql(u8, proj, "up_proj"))
         return error.UnclassifiedMimoTensor;
@@ -743,7 +745,8 @@ fn validateExl3Expert(key: []const u8, meta: TensorMeta, config: *const model.Mo
     const inter: u64 = config.moe_intermediate_size;
     const in_dim: u64 = if (down) inter else hidden;
     const out_dim: u64 = if (down) hidden else inter;
-    const experts: u64 = config.num_experts;
+    if (meta.shape.len == 0 or meta.shape[0] == 0) return error.MimoTensorShapeMismatch;
+    const experts = meta.shape[0];
     if (std.mem.eql(u8, part, "trellis")) {
         if (meta.dtype != .u16) return error.MimoTensorDtypeMismatch;
         if (meta.shape.len != 4) return error.MimoTensorShapeMismatch;
@@ -779,6 +782,18 @@ fn affineTrunkBase(key: []const u8) ?[]const u8 {
 }
 
 fn validateResident(source: *const SourceIndex, allocator: Allocator, key: []const u8, meta: TensorMeta, config: *const model.ModelConfig) !void {
+    if (config.expert_layout == .exl3_k4) {
+        if (layerKey(key)) |ref| {
+            if (std.mem.eql(u8, ref.rest, "mlp.gate.weight") or std.mem.eql(u8, ref.rest, "mlp.gate.e_score_correction_bias")) {
+                const router_key = try std.fmt.allocPrint(allocator, "model.layers.{d}.mlp.gate.weight", .{ref.layer});
+                const router = source.tensors.get(router_key) orelse return error.MissingMimoRequiredTensor;
+                if (router.shape.len != 2 or router.shape[0] == 0 or router.shape[0] > std.math.maxInt(u32)) return error.Exl3RouterWidthMismatch;
+                var local = config.*;
+                local.num_experts = @intCast(router.shape[0]);
+                return validateDense(key, meta, &local);
+            }
+        }
+    }
     const base = affineTrunkBase(key) orelse return validateDense(key, meta, config);
     if (std.mem.endsWith(u8, key, ".weight") and meta.dtype != .u32) return validateDense(key, meta, config);
     const w_key = try std.fmt.allocPrint(allocator, "{s}.weight", .{base});
@@ -855,19 +870,31 @@ fn validateRequired(
             try requireKind(source, allocator, config, try std.fmt.allocPrint(allocator, "{s}.mlp.gate.weight", .{layer_prefix}), .resident);
             try requireKind(source, allocator, config, try std.fmt.allocPrint(allocator, "{s}.mlp.gate.e_score_correction_bias", .{layer_prefix}), .resident);
             if (config.expert_layout == .exl3_k4) {
-                for ([_][]const u8{ "gate", "up", "down" }) |projection| {
-                    for ([_][]const u8{ "trellis", "suh", "svh" }) |part| {
-                        const k = try std.fmt.allocPrint(allocator, "{s}.mlp.switch_mlp.{s}_proj.{s}", .{ layer_prefix, projection, part });
-                        try requireKind(source, allocator, config, k, .routed_expert);
-                    }
-                }
-                const gate_key = try std.fmt.allocPrint(allocator, "{s}.mlp.switch_mlp.gate_proj.trellis", .{layer_prefix});
-                const up_key = try std.fmt.allocPrint(allocator, "{s}.mlp.switch_mlp.up_proj.trellis", .{layer_prefix});
-                if (source.tensors.get(gate_key).?.shape[3] != source.tensors.get(up_key).?.shape[3])
-                    return error.Exl3GateUpRateMismatch;
+                _ = try validateExl3Layer(source, allocator, config, layer_prefix);
             }
         }
     }
+}
+
+fn validateExl3Layer(source: *const SourceIndex, allocator: Allocator, config: *const model.ModelConfig, layer_prefix: []const u8) !@import("sushi_exl3").GroupLayout {
+    var plan = @import("sushi_exl3").GroupLayout.init(config.hidden_size, config.moe_intermediate_size, config.expert_quant_rate);
+    const prefix = try std.fmt.allocPrint(allocator, "{s}.mlp.switch_mlp.", .{layer_prefix});
+    const router = source.tensors.get(try std.fmt.allocPrint(allocator, "{s}.mlp.gate.weight", .{layer_prefix})) orelse return error.MissingMimoRequiredTensor;
+    if (router.shape.len != 2 or router.shape[0] > std.math.maxInt(u32)) return error.Exl3RouterWidthMismatch;
+    var it = source.tensors.iterator();
+    while (it.next()) |entry| {
+        if (!std.mem.startsWith(u8, entry.key_ptr.*, prefix)) continue;
+        const meta = entry.value_ptr.*;
+        _ = try plan.add(entry.key_ptr.*[prefix.len..], meta.shape, switch (meta.dtype) {
+            .u16 => .u16,
+            .f16 => .f16,
+            else => .other,
+        });
+        _ = try payloadBytes(meta, null);
+    }
+    try plan.finish(@intCast(router.shape[0]), config.num_experts_per_tok, config.expert_streaming, config.num_experts);
+    if (config.moe_n_group > 1 and (plan.grouped.? or router.shape[0] != config.num_experts)) return error.Exl3RouterGroupsUnsupported;
+    return plan;
 }
 
 fn validatePlan(source: *const SourceIndex, allocator: Allocator, config: *const model.ModelConfig) !void {
@@ -907,7 +934,8 @@ fn countResidentBytes(
         const meta = entry.value_ptr.*;
         switch (try classifyKey(key, config)) {
             .skipped, .fp8_scale => {},
-            .resident, .routed_expert => {
+            .resident, .routed_expert => |kind| {
+                if (kind == .routed_expert and config.expert_streaming) continue;
                 var bytes = try payloadBytes(meta, null);
                 // The transformer loader keeps an f32 copy of each router for f32 routing.
                 if (layerKey(key)) |ref| if (std.mem.eql(u8, ref.rest, "mlp.gate.weight")) {
@@ -1152,7 +1180,7 @@ fn testF32Bytes(allocator: Allocator, values: []const f32) ![]u8 {
     return bytes;
 }
 
-const TinySourceFixture = struct {
+pub const TinySourceFixture = struct {
     allocator: Allocator,
     path: []u8,
     config: model.ModelConfig,
@@ -1162,7 +1190,7 @@ const TinySourceFixture = struct {
     mlp_scales: []u8,
     embed: []u8,
 
-    fn deinit(self: *TinySourceFixture) void {
+    pub fn deinit(self: *TinySourceFixture) void {
         self.allocator.free(self.path);
         self.allocator.free(self.qkv_weight);
         self.allocator.free(self.qkv_scales);
@@ -1210,7 +1238,7 @@ fn redirectToNewShard(io: std.Io, allocator: Allocator, tmp: *std.testing.TmpDir
     try writeTestIndex(io, allocator, dir, entries.items);
 }
 
-fn makeTinySourceFixture(
+pub fn makeTinySourceFixture(
     io: std.Io,
     allocator: Allocator,
     tmp: *std.testing.TmpDir,
@@ -1856,11 +1884,11 @@ test "EXL3 shard stamp rejects invalid and nonfinite rates" {
     var config: model.ModelConfig = undefined;
     config.expert_layout = .exl3_k4;
     config.expert_quant_rate = .{ .n = 64 };
-    for ([_][]const u8{ "0", "1.5", "2.0625", "nan", "inf", "-inf" }) |k| {
+    for ([_][]const u8{ "0", "0.5", "2.0625", "4.5", "nan", "inf", "-inf" }) |k| {
         try source.stamps.put("expert.safetensors", .{ .k = k });
         try std.testing.expectError(error.Exl3ShardStampMismatch, validateShardStamps(&source, &config));
     }
-    for ([_][]const u8{ "2", "2.125", "2.5", "3", "4" }) |k| {
+    for ([_][]const u8{ "1", "1.5", "2", "2.125", "2.5", "3", "4" }) |k| {
         try source.stamps.put("expert.safetensors", .{ .k = k });
         try validateShardStamps(&source, &config);
     }
@@ -1893,7 +1921,7 @@ test "mimo EXL3 preflight rejects dimensions outside H128" {
     try validateExl3Expert("model.layers.1.mlp.switch_mlp.gate_proj.trellis", valid_meta, &config);
 }
 
-test "mimo EXL3 preflight refuses mismatched gate and up rates" {
+test "sushi coder MiMo preflight admits independent gate and up rates" {
     const t = std.testing;
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
@@ -1914,7 +1942,7 @@ test "mimo EXL3 preflight refuses mismatched gate and up rates" {
     const original = up.*;
     up.shape = &.{ 2, 8, 8, 48 };
     up.data_end = up.data_start + 2 * 8 * 8 * 48 * 2;
-    try t.expectError(error.Exl3GateUpRateMismatch, validatePlan(&source, alloc, &config));
+    try validatePlan(&source, alloc, &config);
     up.* = original;
     const down = source.tensors.getPtr("model.layers.1.mlp.switch_mlp.down_proj.trellis").?;
     down.shape = &.{ 2, 8, 8, 48 };
@@ -1960,4 +1988,258 @@ test "mimo source classifies a multi-layer dense prefix's FP8 MLP as the trunk i
         const w = weights.get(k) orelse return error.TestMissingWeight;
         try t.expectEqual(mlx.mlx_dtype.uint8, mlx.mlx_array_dtype(w));
     }
+}
+
+test "sushi coder MiMo accepts grouped tensors and pruned experts" {
+    var config = model.ModelConfig{};
+    config.expert_layout = .exl3_k4;
+    config.expert_quant_rate = .{ .n = 64 };
+    config.num_hidden_layers = 3;
+    config.first_k_dense_replace = 1;
+    config.num_experts = 256;
+    config.hidden_size = 128;
+    config.moe_intermediate_size = 128;
+    const meta = TensorMeta{ .dtype = .u16, .shape = &.{ 2, 8, 8, 32 }, .data_start = 0, .data_end = 2 * 8 * 8 * 32 * 2, .data_base = 0, .file = "experts.safetensors" };
+    try validateExl3Expert("model.layers.1.mlp.switch_mlp.gate_proj.g0.trellis", meta, &config);
+    try validateExl3Expert("model.layers.2.mlp.switch_mlp.gate_proj.trellis", meta, &config);
+}
+
+test "sushi coder MiMo ragged bill equals all stored tensors" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTinyExl3Source(t.io, alloc, tmp.dir, 40);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(t.io, &path_buf);
+    const path = path_buf[0..len];
+    var config = try model.parseConfig(t.io, alloc, path);
+    config.expert_quant_rate = .{ .n = 64 };
+    var source = try loadSourceIndex(t.io, alloc, path);
+    const before = try countResidentBytes(&source, alloc, &config);
+    for ([_][]const u8{ "gate", "up", "down" }, 0..) |proj, p| {
+        for ([_][]const u8{ "trellis", "suh", "svh" }, 0..) |part, i| {
+            const old = try std.fmt.allocPrint(alloc, "model.layers.1.mlp.switch_mlp.{s}_proj.{s}", .{ proj, part });
+            const original = source.tensors.fetchRemove(old).?.value;
+            for (0..2) |group| {
+                var meta = original;
+                const e: u64 = if (group == 0) 1 else 2;
+                const n: u64 = @intCast(32 + 16 * ((group + p) % 3));
+                meta.shape = if (i == 0) try alloc.dupe(u64, &.{ e, 8, 8, n }) else try alloc.dupe(u64, &.{ e, 128 });
+                meta.data_end = meta.data_start + (if (i == 0) e * 8 * 8 * n * 2 else e * 128 * 2);
+                const key = try std.fmt.allocPrint(alloc, "model.layers.1.mlp.switch_mlp.{s}_proj.g{d}.{s}", .{ proj, group, part });
+                try source.tensors.put(key, meta);
+            }
+        }
+    }
+    const router = source.tensors.getPtr("model.layers.1.mlp.gate.weight").?;
+    router.shape = &.{ 3, 128 };
+    router.data_end = router.data_start + 3 * 128 * 2;
+    const bias = source.tensors.getPtr("model.layers.1.mlp.gate.e_score_correction_bias").?;
+    bias.shape = &.{3};
+    bias.data_end = bias.data_start + 3 * 4;
+    try validatePlan(&source, alloc, &config);
+    const old_experts = 2 * 3 * (8 * 8 * 40 * 2 + 256 * 2);
+    const new_experts = 3 * (8 * 8 * (32 + 48 + 64) * 2 + 3 * 256 * 2);
+    try t.expectEqual(before - old_experts + new_experts + 128 * 6 + 4, try countResidentBytes(&source, alloc, &config));
+    config.num_experts_per_tok = 4;
+    try t.expectError(error.Exl3TopKExceedsExperts, validatePlan(&source, alloc, &config));
+    config.num_experts_per_tok = 1;
+    config.moe_n_group = 2;
+    try t.expectError(error.Exl3RouterGroupsUnsupported, validatePlan(&source, alloc, &config));
+    config.moe_n_group = 1;
+    config.expert_streaming = true;
+    try t.expectError(error.Exl3RaggedStreamingUnsupported, validatePlan(&source, alloc, &config));
+}
+
+pub fn validateExl3Pack(io: std.Io, allocator: Allocator, model_dir: []const u8, config: *const model.ModelConfig) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const source = try loadSourceIndex(io, alloc, model_dir);
+    const mimo = std.mem.eql(u8, config.model_type, "mimo_v2");
+    if (mimo) try validateShardStamps(&source, config);
+    const prefix = if (mimo) "model" else "language_model.model";
+    for (config.first_k_dense_replace..config.num_hidden_layers) |layer| {
+        const base = try std.fmt.allocPrint(alloc, "{s}.layers.{d}", .{ prefix, layer });
+        _ = try validateExl3Layer(&source, alloc, config, base);
+    }
+    if (!mimo) {
+        var it = source.tensors.keyIterator();
+        while (it.next()) |key| {
+            if (std.mem.startsWith(u8, key.*, "language_model.mtp.layers.0.")) {
+                _ = try validateExl3Layer(&source, alloc, config, "language_model.mtp.layers.0");
+                break;
+            }
+        }
+    }
+}
+
+test "sushi coder incomplete grouped EXL3 index refuses instead of guessing a layout" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTinyExl3Source(t.io, alloc, tmp.dir, 40);
+    const raw = try tmp.dir.readFileAlloc(t.io, "model.safetensors.index.json", alloc, .limited(1024 * 1024));
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    const map = &parsed.value.object.getPtr("weight_map").?.object;
+    var grouped: std.json.ObjectMap = .empty;
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (std.mem.eql(u8, key, "model.layers.1.mlp.switch_mlp.up_proj.trellis")) continue;
+        const renamed = if (std.mem.indexOf(u8, key, ".mlp.switch_mlp.") != null) blk: {
+            const dot = std.mem.lastIndexOfScalar(u8, key, '.').?;
+            break :blk try std.fmt.allocPrint(alloc, "{s}.g0{s}", .{ key[0..dot], key[dot..] });
+        } else key;
+        try grouped.put(alloc, renamed, entry.value_ptr.*);
+    }
+    map.* = grouped;
+    const broken = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "model.safetensors.index.json", .data = broken });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(t.io, &buf);
+    try t.expectError(error.ExpertLayoutUnsupported, model.parseConfig(t.io, alloc, buf[0..len]));
+}
+
+test "sushi coder qwen trunk and MTP preflight use each router width" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var tensors: std.ArrayList(TestTensor) = .empty;
+    var entries: std.ArrayList(TestIndexEntry) = .empty;
+    for ([_][]const u8{ "language_model.model.layers.0", "language_model.model.layers.1", "language_model.mtp.layers.0" }, 0..) |base, layer| {
+        const e: u64 = if (layer == 1) 2 else 3;
+        try tensors.append(alloc, .{
+            .key = try std.fmt.allocPrint(alloc, "{s}.mlp.gate.weight", .{base}),
+            .dtype = "BF16",
+            .shape = try alloc.dupe(u64, &.{ e, 128 }),
+            .bytes = try testBf16Bytes(alloc, @intCast(e * 128), 0x3f80),
+        });
+        for (0..2) |group| {
+            const count: u64 = if (group == 0) 1 else e - 1;
+            for ([_][]const u8{ "gate", "up", "down" }, 0..) |projection, p| {
+                for ([_][]const u8{ "trellis", "suh", "svh" }, 0..) |part, i| {
+                    const n: u64 = @intCast(32 + 16 * ((group + p) % 3));
+                    try tensors.append(alloc, .{
+                        .key = try std.fmt.allocPrint(alloc, "{s}.mlp.switch_mlp.{s}_proj.g{d}.{s}", .{ base, projection, group, part }),
+                        .dtype = if (i == 0) "U16" else "F16",
+                        .shape = if (i == 0) try alloc.dupe(u64, &.{ count, 8, 8, n }) else try alloc.dupe(u64, &.{ count, 128 }),
+                        .bytes = try testBf16Bytes(alloc, @intCast(if (i == 0) count * 8 * 8 * n else count * 128), 0),
+                    });
+                }
+            }
+        }
+    }
+    for (tensors.items) |tensor| try entries.append(alloc, .{ .key = tensor.key, .file = "ragged.safetensors" });
+    try writeTestShard(t.io, alloc, tmp.dir, "ragged.safetensors", tensors.items);
+    try writeTestIndex(t.io, alloc, tmp.dir, entries.items);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(t.io, &buf);
+    var cfg = model.ModelConfig{ .model_type = "qwen4_exp", .expert_layout = .exl3_k4, .num_hidden_layers = 2, .num_experts = 512, .num_experts_per_tok = 2, .hidden_size = 128, .moe_intermediate_size = 128 };
+    try validateExl3Pack(t.io, alloc, buf[0..len], &cfg);
+    cfg.num_experts_per_tok = 3;
+    try t.expectError(error.Exl3TopKExceedsExperts, validateExl3Pack(t.io, alloc, buf[0..len], &cfg));
+    cfg.num_experts_per_tok = 2;
+    cfg.expert_streaming = true;
+    try t.expectError(error.Exl3RaggedStreamingUnsupported, validateExl3Pack(t.io, alloc, buf[0..len], &cfg));
+}
+
+test "sushi coder legacy uniform billing preserves trunk-only config" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var bills: [2]u64 = undefined;
+    for ([_]u64{ 0, 40 }, 0..) |n, i| {
+        const name = if (n == 0) "trunk" else "uniform";
+        try tmp.dir.createDirPath(t.io, name);
+        var dir = try tmp.dir.openDir(t.io, name, .{});
+        defer dir.close(t.io);
+        try writeTinyExl3Source(t.io, alloc, dir, n);
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const len = try dir.realPath(t.io, &buf);
+        var config = try model.parseConfig(t.io, alloc, buf[0..len]);
+        defer config.deinit(alloc);
+        try t.expectEqual(if (n == 0) expert_quant.Layout.bf16_fused else expert_quant.Layout.exl3_k4, config.expert_layout);
+        bills[i] = try residentBytesWithConfig(t.io, alloc, buf[0..len], &config);
+    }
+    try t.expectEqual(@as(u64, 3 * (2 * 8 * 8 * 40 * 2 + 2 * 2 * 128 * 2)), bills[1] - bills[0]);
+}
+
+fn checkMimoExl3StreamTrunk(runtime: bool) !void {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTinyExl3Source(t.io, a, tmp.dir, 36);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(t.io, &buf);
+    const path = buf[0..len];
+    var cfg = try model.parseConfig(t.io, a, path);
+    defer cfg.deinit(a);
+    const resident_bill = try residentBytesWithConfig(t.io, a, path, &cfg);
+    cfg.expert_streaming = true;
+    const streamed_bill = try residentBytesWithConfig(t.io, a, path, &cfg);
+    try t.expectEqual(@as(u64, 3 * (2 * 8 * 8 * 36 * 2 + 2 * 2 * 128 * 2)), resident_bill - streamed_bill);
+    try t.expectEqual(streamed_bill, (try model.streamingResidentSplit(t.io, a, path, .exl3_k4)).trunk);
+    if (!runtime) return;
+    cfg.expert_streaming = false;
+    var resident = try model.loadWeightsForConfig(t.io, a, path, &cfg, false);
+    defer resident.deinit();
+    cfg.expert_streaming = true;
+    var streamed = try model.loadWeightsForConfig(t.io, a, path, &cfg, false);
+    defer streamed.deinit();
+    var it = resident.map.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (std.mem.indexOf(u8, key, ".switch_mlp.") != null) {
+            try t.expect(streamed.get(key) == null);
+            continue;
+        }
+        const actual = streamed.get(key) orelse return error.MissingStreamedTrunk;
+        try t.expectEqual(mlx.mlx_array_dtype(entry.value_ptr.*), mlx.mlx_array_dtype(actual));
+        try t.expectEqualSlices(c_int, mlx.getShape(entry.value_ptr.*), mlx.getShape(actual));
+        try mlx.check(mlx.mlx_array_eval(entry.value_ptr.*));
+        try mlx.check(mlx.mlx_array_eval(actual));
+        const data = struct {
+            fn ptr(arr: mlx.mlx_array) [*]const u8 {
+                return switch (mlx.mlx_array_dtype(arr)) {
+                    .uint8 => mlx.mlx_array_data_uint8(arr).?,
+                    .bfloat16 => @ptrCast(mlx.mlx_array_data_bfloat16(arr).?),
+                    .float32 => @ptrCast(mlx.mlx_array_data_float32(arr).?),
+                    else => unreachable,
+                };
+            }
+        }.ptr;
+        const expected_bytes = data(entry.value_ptr.*);
+        const actual_bytes = data(actual);
+        const bytes = mlx.mlx_array_size(actual) * @as(usize, switch (mlx.mlx_array_dtype(actual)) {
+            .uint8 => 1,
+            .bfloat16 => 2,
+            .float32 => 4,
+            else => unreachable,
+        });
+        try t.expectEqualSlices(u8, expected_bytes[0..bytes], actual_bytes[0..bytes]);
+    }
+}
+
+test "MiMo EXL3 streaming CPU bills the FP8 trunk without routed banks" {
+    try checkMimoExl3StreamTrunk(false);
+}
+
+test "MiMo EXL3 streaming loads the identical FP8 trunk without routed banks" {
+    try checkMimoExl3StreamTrunk(true);
 }

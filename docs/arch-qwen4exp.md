@@ -73,8 +73,8 @@ hidden 2560, expert intermediate 640.
 - Which arm a wide gather takes is MEASURED on the table, not predicted from RAM: `calibrateArm` reads 128 random rows
   both ways, on DISJOINT sets so neither arm warms the other's pages, before the warm thread faults the table in, and
   takes the pool only when it wins by 20%; SSD and page-cache state determine the choice on each load.
-- `SUSHI_NGRAM_WARM` preads the whole table, and the residency cap (`ngramCacheLimit` = half of RAM) already declines
-  one that cannot be held. Calibration and residency measurements: [perf-baselines](perf-baselines.md#ngram-arm).
+- `SUSHI_NGRAM_WARM` preads the whole table, and the residency cap (`ngramCacheLimit` = half of RAM) declines any
+  table that cannot be held, bf16 or 4-bit (a 32 GB Mac reads the 4-bit table by row). Calibration and residency measurements: [perf-baselines](perf-baselines.md#ngram-arm).
 - A table under the cap is a page-cache claim from `startWarm` to `close` (`page_cache_claim`), billed as GPU memory
   by the hot cache's unnamed budget ([engine-prefix-cache](engine-prefix-cache.md#budget)): wired KV evicts it.
 - The n-gram hash's eos is the TEXT config's (`ngram_eos`).

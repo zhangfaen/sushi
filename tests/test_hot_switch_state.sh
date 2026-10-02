@@ -43,8 +43,11 @@ bad() { echo -e "  ${RED}FAIL${NC} $1"; shift; for l in "$@"; do echo "        $
 [ -d "$ROOT" ] || { echo "SKIP: no model root at $ROOT"; exit 0; }
 [ -x ./zig-out/bin/sushi ] || { echo "FAIL: build first (zig build -Doptimize=ReleaseFast)"; exit 1; }
 
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    exit 1
+fi
 LOG=$(mktemp /tmp/hot_switch.XXXXXX)
-pkill -f "bin/sushi" 2>/dev/null; sleep 1
 ./zig-out/bin/sushi serve --port "$PORT" --host 127.0.0.1 --model-dir "$ROOT" \
     --log-level debug > "$LOG" 2>&1 &
 SERVER_PID=$!

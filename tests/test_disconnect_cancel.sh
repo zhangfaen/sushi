@@ -49,11 +49,13 @@ if [ ! -d "$MODEL" ]; then
     exit 0
 fi
 
-pkill -f "sushi.*--port $PORT" 2>/dev/null
-sleep 1
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    exit 1
+fi
 # Cancellation takes effect at a chunk boundary; auto-sized chunks can exceed
 # the entire 12s bound under GPU contention. Pin the workload, not a looser deadline.
-"$BINARY" --model "$MODEL" --serve --port "$PORT" --ctx-size 32768 --prefill-chunk 512 --no-pld --log-level debug > "$LOG" 2>&1 &
+"$BINARY" --model "$MODEL" --serve --port "$PORT" --ctx-size 32768 --prefill-chunk 512 --no-pld --metrics --log-level debug > "$LOG" 2>&1 &
 SERVER_PID=$!
 trap 'kill $SERVER_PID 2>/dev/null' EXIT
 
@@ -109,6 +111,22 @@ check "follow-up request succeeded" "$([ $? -eq 0 ] && echo 1 || echo 0)"
 check "follow-up completed in <12s (ghost cancelled)" "$([ "$ELAPSED" -lt 12 ] && echo 1 || echo 0)"
 grep -q "client disconnected" "$LOG"
 check "server logged the disconnect-cancel" "$([ $? -eq 0 ] && echo 1 || echo 0)"
+
+echo "3. disconnect mid-decode cancels a non-stream ghost (/v1/messages stream=false)"
+# A non-stream request never idles once tokens flow, so an idle-only peer probe misses a client that left mid-decode.
+curl -s -m 5 "$BASE/v1/messages" -H 'Content-Type: application/json' \
+    -d '{"model":"m","max_tokens":6000,"stream":false,"messages":[{"role":"user","content":"Count from 1 to 3000, one number per line."}]}' > /dev/null 2>&1
+# A batching server serves a follow-up beside a ghost, so timing cannot tell; the live session list can.
+sleep 8
+LIVE=$(curl -s -m 10 "$BASE/metrics.json" | python3 -c 'import sys,json; print(sum(1 for x in json.load(sys.stdin).get("sessions",[]) if x.get("phase") in ("prefill","decode")))')
+echo "    -> requests still generating 8s after the client left: $LIVE"
+check "no request still decoding for the departed client" "$([ "$LIVE" = 0 ] && echo 1 || echo 0)"
+SMALL=$(curl -s -m 120 "$BASE/v1/messages" -H 'Content-Type: application/json' \
+    -d '{"model":"m","max_tokens":8,"messages":[{"role":"user","content":"Say OK."}]}')
+echo "$SMALL" | grep -q '"type":"message"'
+check "follow-up request succeeded" "$([ $? -eq 0 ] && echo 1 || echo 0)"
+grep -q "client disconnected while decoding (non-stream)" "$LOG"
+check "server logged the non-stream decode cancel" "$([ $? -eq 0 ] && echo 1 || echo 0)"
 
 echo ""
 echo "===== $PASS passed, $FAIL failed ====="

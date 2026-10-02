@@ -43,13 +43,14 @@ LOG="$(mktemp)"
 SERVER_PID=""
 cleanup() {
     [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
-    pkill -f "sushi.*--port $PORT" 2>/dev/null
     rm -rf "$ROOT_DIR" "$LOG"
 }
 trap cleanup EXIT
 
-pkill -f "sushi.*--port $PORT" 2>/dev/null
-sleep 0.5
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    exit 1
+fi
 "$BINARY" --serve --model-dir "$ROOT_DIR" --port "$PORT" --log-file off > "$LOG" 2>&1 &
 SERVER_PID=$!
 UP=0

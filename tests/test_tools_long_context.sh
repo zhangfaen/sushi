@@ -34,8 +34,11 @@ bad() { echo -e "  ${RED}FAIL${NC} $1"; shift; for l in "$@"; do echo "        $
 [ -x ./zig-out/bin/sushi ] || { echo "FAIL: build first"; exit 1; }
 
 RUNGS="${LONGCTX_RUNGS:-16000,32000,64000}"
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    exit 1
+fi
 LOG=$(mktemp /tmp/tools_longctx.XXXXXX)
-pkill -f "bin/sushi" 2>/dev/null; sleep 1
 ./zig-out/bin/sushi --model "$MODEL" --serve --port "$PORT" --ctx-size 131072 \
     --log-level debug > "$LOG" 2>&1 &
 SERVER_PID=$!

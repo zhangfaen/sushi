@@ -155,8 +155,10 @@ echo "  model: $MODEL"
 echo "  prompt: <echo-heavy code rename>"
 echo
 
-pkill -f "sushi.*--port $PORT" 2>/dev/null || true
-sleep 1
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    exit 1
+fi
 
 # Reference run: regular streaming, no PLD. This is what the streamed bytes
 # *should* look like.

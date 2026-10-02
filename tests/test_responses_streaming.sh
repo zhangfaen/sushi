@@ -288,5 +288,71 @@ else
 fi
 echo ""
 
+# ── Test F: a reader that lags the end of the stream gets EOF, not a reset ──
+# The SSE body ends when the server closes. A socket closed under a reader that
+# has not caught up is dropped by the kernel with an RST once its FIN_WAIT_2
+# timer runs out (net.inet.tcp.fin_timeout, 60 s), so the client read the whole
+# body and then ECONNRESET instead of EOF. The reader here waits out that timer
+# after the server has finished (this test takes over a minute).
+echo "--- Test F: tools + reasoning budget — a lagging reader ends with EOF, not a reset ---"
+F_OUT=$(python3 - "$PORT" <<'PY'
+import json, socket, subprocess, sys, time
+
+port = int(sys.argv[1])
+fin_timeout = int(subprocess.check_output(["sysctl", "-n", "net.inet.tcp.fin_timeout"]).strip()) / 1000
+body = json.dumps({
+    "model": "sushi",
+    "input": "What is the weather in Paris? Think about which unit to use first.",
+    "tools": [{"type": "function", "name": "get_weather", "description": "Get the current weather for a city",
+               "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}],
+    "reasoning": {"effort": "medium"}, "reasoning_budget_tokens": 24,
+    "max_output_tokens": 512, "temperature": 0, "stream": True,
+}).encode()
+sock = socket.create_connection(("127.0.0.1", port))
+sock.sendall((f"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+              f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n").encode() + body)
+client_port = sock.getsockname()[1]
+sock.settimeout(90)
+head = sock.recv(4096, socket.MSG_PEEK)
+if not head.startswith(b"HTTP/1.1 200"):
+    raise RuntimeError(head.decode("utf-8", errors="replace"))
+
+def server_closed():
+    # Darwin TCP_CONNECTION_INFO starts with tcpi_state. CLOSE_WAIT (5)
+    # means the client received FIN without consuming the queued body.
+    return sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_CONNECTION_INFO, 104)[0] == 5
+
+deadline = time.time() + 180
+while time.time() < deadline and not server_closed():
+    time.sleep(1)
+if not server_closed():
+    raise RuntimeError("client did not receive server FIN")
+time.sleep(fin_timeout + 5)
+sock.settimeout(30)
+
+data, end = b"", "eof"
+try:
+    while True:
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        data += chunk
+except ConnectionResetError:
+    end = "reset"
+sock.close()
+text = data.decode("utf-8", errors="replace")
+print(f"f end={end} completed={int('response.completed' in text)} done={int('data: [DONE]' in text)} "
+      f"budget_closed={int('Considering the limited time' in text)} bytes={len(data)}")
+PY
+) || F_OUT="f end=exception"
+echo "  $F_OUT"
+if echo "$F_OUT" | grep -q "end=eof completed=1 done=1"; then
+    run_test "lagging reader: whole body, then EOF" "PASS" ""
+else
+    run_test "lagging reader: whole body, then EOF" "FAIL" "$F_OUT"
+fi
+echo ""
+
+
 echo "=== Result: $PASS/$TOTAL passed ==="
 [ "$FAIL" -eq 0 ]

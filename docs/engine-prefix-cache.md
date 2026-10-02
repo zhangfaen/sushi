@@ -34,17 +34,32 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - The always-on SSM snapshot sits 30 tokens BEFORE prompt end; a restored tail inside that window forwards as ONE
   span (`ssmSnapshotBackoff`). Guard: `tests/test_hybrid_reuse_equivalence.sh`.
 - **A ringed (sliding-window) entry restores at its end or at one of its ring checkpoints**
-  (`KVCache.ringCheckpoint`, `Entry.ring_cps`, the highest `RING_CHECKPOINT_MAX` = 4 kept): each ringed layer's
+  (`KVCache.ringCheckpoint`, `Entry.ring_cps`, up to `RING_CHECKPOINT_MAX` = 8): each ringed layer's
   window + 30 rows at a position (down to the window when the ring holds no more, as one restored off a checkpoint
-  does); the slot's own are its restore point and its prompt end (`SlotRingCps`). A reply longer than the
+  does); the slot's own are its restore point, its prompt end and its message marks (`SlotRingCps`). A reply longer than the
   ring's slack compacts it past where the next turn diverges (the previous reply re-renders); the checkpoint's rows
   go under the ringed layers (`restoreRing`) and the usual clamp follows.
   A checkpoint restore of fewer than `RING_RESTORE_MIN_TOKENS` (64) cold-prefills: below it a restore cost more than
   the cold prefill it replaced.
-  Below both, `SlidingRingRewindPastWindow` → cold prefill.
+  Below both, `SlidingRingRewindPastWindow` → cold prefill, and the declined entry keeps its recency: promoted, a
+  header-only match made the entry a later turn needed the next count-cap victim.
+- **A ringed prefill marks the message starts it forwards** (`ringMarkPositions`: `<|im_start|>` past the restored
+  prefix and short of the prompt end's reach, at most `RING_MARKS_MAX` = 4, thinned keeping the first and the last):
+  each ringed KV write fills a mark it reaches before its compaction drops the rows (`KVCache.ring_marks`), so no
+  chunk is split and the forward is unchanged. A new session sharing only another's system prompt and tools
+  diverges inside its first user message, below every fork and prompt end, and restores at that mark.
+  Measured (MiMo 2.3bpw, kv8, MTP and prefix cache at their defaults, a 12,042-token tools + system prefix, a
+  ~300-token first task, 12,346-token prompts, `taskpolicy -a`, lock per boot, busy box, 2026-10-01). One boot of
+  63476cd1: the first session cold-prefills in 9,876 ms; the second and third restore 12,037 / 12,042 tokens and
+  prefill in 434 / 420 ms. One boot of main 819b4751: the first session cold in 15,682 ms, and the second and third
+  cold again (`cached_n` 0) in 14,970 / 14,582 ms. Splitting a chunk at the boundary instead would cost ~0.4 s per
+  split on MiMo (the fixed per-chunk cost the 2025- and 4096-row prefill meter rows imply).
+- **Ring checkpoints thin span-preserving** (`thinRingCps`, on merge, inheritance and shed): the lowest (a shared
+  preamble's mark) and the newest stay longest; kept highest-first, a conversation's later turns pushed the preamble's
+  mark out after two turns.
 - **The SSD tier restores a ringed entry only at a ring file** (`bestRingMatch`, `restoreIntoRinged`): chunks hold the
   global layers, `r{pos}.safetensors` each restore point's ringed rows (the RAM entry's checkpoints plus its end,
-  the highest `RING_DISK_MAX_PER_ENTRY` = 8 kept, salvaged per file at scan; manifest v9, which an older reader
+  `RING_DISK_MAX_PER_ENTRY` = 8 kept, thinned as in RAM, salvaged per file at scan; manifest v9, which an older reader
   drops) ([arch-mimo-v2](arch-mimo-v2.md#sliding-layers-the-ring)).
 - **A disk restore fills its buffers chunk by chunk** (`restoreKvInto`): each chunk is evaluated into buffers
   allocated at the restored length before the next file opens. A lazy `mlx_load_safetensors` holds its file open until
@@ -68,6 +83,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - **Hybrid candidates rank by RESTORABLE checkpoint position, not raw match** (`findBestRestorableMatch` RAM,
   `bestHybridMatch` disk). Ringed candidates rank by `ringRestore`; an un-restorable one stays eligible at 0, so a
   lookup with nothing better still declines by name.
+- **A lookup that restores 0 rows is not a use**, SSD-first or not (a hybrid with no usable checkpoint, the QSA
+  history decline): the entry keeps its recency and its admission protection drops, else the count cap's next
+  victim is an entry that can serve.
 - Checkpoint retention thins the INTERIOR with a dense newest quarter (`spanPreservingDropIndex`, `ThinPolicy`).
 - An oversized candidate is TRIMMED to the longest restorable prefix that fits (`trimLenForBudget`,
   `KVCacheSnapshot.trimmedCopy` is a REAL copy); a QSA trim bills the bank on the final retained checkpoint.
@@ -91,7 +109,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   where the ceiling holds it beside the weights, the n-gram page cache (`page_cache_claim`) and a cold full-context
   prompt's bill (MiMo refuses rather than evicts); else that room, at most half the bill, so an outgrown session's
   trim copy fits beside it. A flag stands, `2GB` too; context sizing and the chunk pin still read the raw ask.
-- A replacement over the budget sheds its lowest ring checkpoints before the entry goes (`shedRingCheckpoints`).
+- A replacement over the budget sheds ring checkpoints (thinned as above) before the entry goes (`shedRingCheckpoints`).
 - Measured (b9dbbf53 plus this change, Sushi-3bpw, auto context 1M, kv8, MTP on; a ~200k-token three-turn session; `taskpolicy -a`,
   fans max, GPU lock per boot; 2026-09-27): unset, the budget is 11516 MB and turns 2-3 prefill in 0.35 s (199.7k
   reused); `--prefix-cache-mem 2GB` keeps a 139k-147k prefix and prefills in 36.0 / 31.3 s (turn 1: 114-115 s cold). The
@@ -99,12 +117,28 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - Eviction is WORKLOAD-fair (`cache_key`: `prompt_cache_key` > `metadata.user_id` > system-prompt hash;
   `lruIndexExcluding`).
 
+## SSD-only storage
+
+`--no-prefix-cache-ram --prefix-cache-disk 10GB` keeps reusable text prefixes on SSD without retaining idle
+KV snapshots in the RAM cache. The live request still needs KV memory, and queued disk writes can hold
+buffers temporarily. The entry count must remain positive: `--prefix-cache-entries 0` disables both tiers.
+With RAM and disk disabled, SSM checkpoint capture is disabled too. `/props` reports
+`settings.prefix_cache.ram_enabled=false` and `mem_bytes=0` when RAM retention is off.
+
+Qwen prefill chunks write through continuously in SSD-only mode. Hybrid SSM checkpoints and MiMo ring
+restore points survive restart. Image-bearing entries remain ineligible for disk persistence. RAM+SSD defaults
+are unchanged. `SUSHI_PREFIX_CACHE_DIR` can select an absolute cache directory; unset, the root stays
+`~/.sushi/kv-cache`. Live tests use a separate root without changing home settings.
+
+Ported from [mlx-serve #680](https://github.com/ddalcu/mlx-serve/pull/680), with Sushi's ring checkpoint handling.
+
 ## SSD-first
 
 - Disk fingerprints include the model path, config size/mtime and overrides, plus sorted indexed weight-shard (or unindexed safetensors) names and size/mtime and `ngram_table.bin` size/mtime; payloads are statted through symlinks, never content-hashed.
 
-- `prefix_cache.ssdFirstActive` = capable arch AND a disk tier, mirrored onto `HotPrefixCache.ssd_first` +
-  `DiskTier.ssd_first`: RAM floors at ONE session, `--prefix-cache-mem` = the IDLE allowance.
+- `prefix_cache.ssdFirstActive` = a disk tier AND (capable arch OR RAM retention disabled), mirrored onto `HotPrefixCache.ssd_first` +
+  `DiskTier.ssd_first`: with RAM enabled it floors at ONE session, `--prefix-cache-mem` = the IDLE allowance.
+  SSD-only storage retains no idle RAM entry.
 - Spill and EVICT are two decisions (`PersistOutcome`: only `.persisted` + an agreeing index + landed files license
   discarding RAM); writes ride `kv_disk_writer.zig` (FIFO, `meta.json` last, epoch fence at the ONE removal site);
   per-chunk write-through; a diverging turn hard-links the donor's LANDED chunks; a full-prefix hit CHECKS the entry

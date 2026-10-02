@@ -41,8 +41,10 @@ if [ ! -x "$BINARY" ]; then
     exit 0
 fi
 
-pkill -f "sushi.*--port $PORT" 2>/dev/null || true
-sleep 1
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    exit 1
+fi
 
 # Build the fake-OOM model: symlink the real (small) files so CPU-side setup
 # succeeds, then add a huge SPARSE dummy weight file to trip the pre-flight.

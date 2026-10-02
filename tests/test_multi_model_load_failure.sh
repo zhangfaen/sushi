@@ -63,8 +63,11 @@ EOF
 cleanup_root() { rm -rf "$TMPROOT"; }
 
 BINARY="${SUSHI_BINARY:-./zig-out/bin/sushi}"
-pkill -f "sushi.*--port $PORT" 2>/dev/null || true
-sleep 1
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    cleanup_root
+    exit 1
+fi
 LOGFILE=$(mktemp)
 "$BINARY" --model-dir "$TMPROOT" --model "$TMPROOT/$VALID_ID" --serve --port "$PORT" \
     ${SUSHI_TEST_EXTRA_ARGS:-} > "$LOGFILE" 2>&1 &

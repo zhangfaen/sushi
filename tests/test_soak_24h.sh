@@ -75,8 +75,10 @@ echo "  health interval:    ${HEALTH_INTERVAL_SEC}s"
 echo "  log:                $SAMPLE_LOG"
 echo
 
-pkill -f "sushi.*--port $PORT" 2>/dev/null || true
-sleep 2
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or set PORT" >&2
+    exit 1
+fi
 
 SERVER_LOG=$(mktemp)
 echo "  starting server (--max-concurrent 4 --kv-quant 4)..."

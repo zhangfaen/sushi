@@ -26,6 +26,18 @@ const Weights = model_mod.Weights;
 const ModelConfig = model_mod.ModelConfig;
 
 pub const MAX_HEADS: usize = 3;
+
+/// The coarse draft readout's width. At 2 bits its top-32 shortlist still holds the drafts the
+/// 3-bit copy picks on MiMo.
+pub fn rerankBits() u32 {
+    const p = std.c.getenv("SUSHI_MTP_DRAFT_HEAD_BITS");
+    return rerankBitsFrom(if (p) |v| std.mem.span(v) else null);
+}
+
+fn rerankBitsFrom(raw: ?[]const u8) u32 {
+    return mtp_mod.draftHeadBitsFrom(raw, 2);
+}
+
 /// Committed rows (hiddens and their next tokens) a state keeps: every head's
 /// window plus the rows a lagging head catches up and a round's drafts.
 const RING_ROWS: usize = 256;
@@ -253,6 +265,16 @@ pub const State = struct {
             errdefer _ = mlx.mlx_array_free(cut);
             const sh = mlx.getShape(self.hid);
             try mlx.check(mlx.mlx_slice(&cut, self.hid, &.{ 0, @intCast(drop), 0 }, 3, &.{ 1, sh[1], sh[2] }, 3, &.{ 1, 1, 1 }, 3, s));
+            // A slice pins the rows it views from: past a prefill chunk, the whole chunk's
+            // hiddens where `billedBytes` holds the ring. Copied and evaluated, it lets go.
+            if (drop > RING_ROWS) {
+                const owned = try transformer_mod.materializedOwnedCopy(s, cut);
+                _ = mlx.mlx_array_free(cut);
+                cut = owned;
+                const vec = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{cut}, 1);
+                defer _ = mlx.mlx_vector_array_free(vec);
+                try mlx.check(mlx.mlx_async_eval(vec));
+            }
             _ = mlx.mlx_array_free(self.hid);
             self.hid = cut;
             self.hid_base += drop;
@@ -307,8 +329,6 @@ pub const Head = struct {
     value_scale: f32,
     eps: f32,
     window: usize,
-    /// Coarse lm_head copy the drafts shortlist on (`mtp.buildRerankCoarse`).
-    rerank: ?mtp_mod.RerankCoarse = null,
     rerank_tried: bool = false,
     rerank_logged: bool = false,
     ev_seed_accept: ?[mtp_mod.MAX_DEPTH]f32 = null,
@@ -408,8 +428,6 @@ pub const Head = struct {
     }
 
     pub fn deinit(self: *Head) void {
-        if (self.rerank) |*rc| rc.deinit();
-        self.rerank = null;
         for (self.owned.items) |a| _ = mlx.mlx_array_free(a);
         self.owned.deinit(self.allocator);
     }
@@ -676,25 +694,71 @@ pub const Head = struct {
         return self.lastRow(try self.forwardRows(target, st, li, st.round_q, @min(st.n_drafts, li)));
     }
 
-    /// Built once, at the first ask: the coarse copy of the target's lm_head.
+    /// One history append and one round of every head on a throwaway state, so their pipelines
+    /// JIT at load instead of inside a request's first rounds. Returns the head steps it ran.
+    pub fn warmup(self: *Head, target: *Transformer) !usize {
+        const hist: usize = 8;
+        var ids: [hist + 2]u32 = undefined;
+        for (&ids, 0..) |*t, i| t.* = @intCast((i * 7919 + 13) % 40000);
+        const st = try self.newState(self.allocator);
+        defer {
+            st.deinit();
+            self.allocator.destroy(st);
+        }
+        var hid = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(hid);
+        try mlx.check(mlx.mlx_zeros(&hid, &[_]c_int{ 1, @intCast(hist + 1), self.hidden }, 3, .bfloat16, self.s));
+        var hist_hid = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(hist_hid);
+        try mlx.check(mlx.mlx_slice(&hist_hid, hid, &.{ 0, 0, 0 }, 3, &.{ 1, @intCast(hist), self.hidden }, 3, &.{ 1, 1, 1 }, 3, self.s));
+        try self.appendHistory(target, st, ids[1 .. hist + 1], hist_hid, 0);
+        var row_hid = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(row_hid);
+        try mlx.check(mlx.mlx_slice(&row_hid, hid, &.{ 0, @intCast(hist), 0 }, 3, &.{ 1, @intCast(hist + 1), self.hidden }, 3, &.{ 1, 1, 1 }, 3, self.s));
+        var out = try self.draftStep(target, st, 0, null, ids[hist + 1 .. hist + 2], row_hid, hist);
+        var steps: usize = 1;
+        while (steps < self.heads) : (steps += 1) {
+            const d = try self.draftSelect(target, out, null);
+            defer _ = mlx.mlx_array_free(d);
+            const next = try self.draftStep(target, st, steps, d, &.{}, null, 0);
+            _ = mlx.mlx_array_free(out);
+            out = next;
+        }
+        defer _ = mlx.mlx_array_free(out);
+        const last = try self.draftSelect(target, out, null);
+        defer _ = mlx.mlx_array_free(last);
+        try mlx.check(mlx.mlx_array_eval(last));
+        // A sampled request drafts from the re-scored shortlist instead of the argmax.
+        if (try self.draftShortlist(target, out, null)) |sl| {
+            var list = sl;
+            defer list.deinit();
+            try mlx.check(mlx.mlx_array_eval(list.exact));
+        }
+        return steps;
+    }
+
+    /// Drafts shortlist on the trunk's coarse lm_head copy (`Transformer.lm_head_coarse`), built at
+    /// the first ask when the trunk has none yet.
     pub fn canRerankDrafts(self: *Head) bool {
+        const t = self.target orelse return false;
+        if (mtp_mod.MtpModel.draftRerankMode() == .off) return false;
         if (!self.rerank_tried) {
             self.rerank_tried = true;
-            if (self.target) |t| {
-                if (mtp_mod.MtpModel.draftRerankMode() != .off)
-                    self.rerank = mtp_mod.buildRerankCoarse(self.s, t, mtp_mod.rerankCoarseBits());
-            }
+            if (t.lm_head_coarse == null) t.lm_head_coarse = mtp_mod.buildRerankCoarse(self.s, t, rerankBits());
         }
-        return self.rerank != null;
+        return t.lm_head_coarse != null;
     }
 
     pub fn draftSelect(self: *Head, target: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !mlx.mlx_array {
-        if (try mtp_mod.rerankSelect(self.s, target, &self.rerank, &self.rerank_logged, x, suppress_mask)) |tok| return tok;
+        if (self.canRerankDrafts()) {
+            if (try mtp_mod.rerankSelect(self.s, target, &target.lm_head_coarse, &self.rerank_logged, x, suppress_mask)) |tok| return tok;
+        }
         return mtp_mod.fullReadoutArgmax(self.s, target, x, suppress_mask);
     }
 
     pub fn draftShortlist(self: *Head, target: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !?mtp_mod.Shortlist {
-        return mtp_mod.rerankShortlist(self.s, target, &self.rerank, &self.rerank_logged, x, suppress_mask);
+        if (!self.canRerankDrafts()) return null;
+        return mtp_mod.rerankShortlist(self.s, target, &target.lm_head_coarse, &self.rerank_logged, x, suppress_mask);
     }
 };
 
@@ -742,6 +806,70 @@ fn expectRowClose(label: []const u8, k: usize, q: usize, ours: mlx.mlx_array, re
         std.debug.print("mimo mtp {s}: head {d} row {d} max |d| {d} > {d}\n", .{ label, k, q, worst, bar });
         return error.TestExpectedEqual;
     }
+}
+
+test "mimo mtp heads warm up every head on a throwaway state (MIMO_V2_MODEL)" {
+    const model_dir = std.c.getenv("MIMO_V2_MODEL") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = std.mem.span(model_dir);
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer if (config.ngram_table_path) |p| a.free(p);
+    var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
+    defer weights.deinit();
+    try transformer_mod.stackMimoFixtureExperts(&weights, config, s);
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, a, config, &weights);
+    defer xfm.deinit();
+    var mtp_weights = try @import("mimo_source.zig").loadMtpWeights(io, a, dir);
+    defer mtp_weights.deinit();
+    var head = (try Head.load(a, s, &config, &mtp_weights)) orelse return error.NoMtpHeads;
+    defer head.deinit();
+    head.target = &xfm;
+    try testing.expectEqual(head.heads, try head.warmup(&xfm));
+    for (xfm.cache.entries) |e| try testing.expect(!e.initialized);
+}
+
+test "mimo mtp drafts through a 2-bit coarse readout unless the env names another width" {
+    try testing.expectEqual(@as(u32, 2), rerankBitsFrom(null));
+    try testing.expectEqual(@as(u32, 3), rerankBitsFrom("3"));
+    try testing.expectEqual(@as(u32, 0), rerankBitsFrom("off"));
+}
+
+test "mimo mtp state keeps its hidden ring, not the prefill chunk it was cut from" {
+    // `State.billedBytes` holds RING_ROWS hiddens (twice); a slice view of a whole chunk's
+    // hiddens held the chunk instead, until the first round replaced it.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const width: c_int = 1024;
+    const rows: usize = 4096;
+    const ids = try testing.allocator.alloc(u32, rows);
+    defer testing.allocator.free(ids);
+    for (ids, 0..) |*id, i| id.* = @intCast(i);
+    var st = State{ .allocator = testing.allocator };
+    defer st.deinit();
+    try mlx.check(mlx.mlx_synchronize(s));
+    _ = mlx.mlx_clear_cache();
+    var before: usize = 0;
+    try mlx.check(mlx.mlx_get_active_memory(&before));
+    {
+        var hidden = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(hidden);
+        try mlx.check(mlx.mlx_ones(&hidden, &.{ 1, @intCast(rows), width }, 3, .bfloat16, s));
+        try mlx.check(mlx.mlx_array_eval(hidden));
+        try st.record(s, 0, hidden, ids);
+    }
+    try mlx.check(mlx.mlx_array_eval(st.hid));
+    try mlx.check(mlx.mlx_synchronize(s));
+    var after: usize = 0;
+    try mlx.check(mlx.mlx_get_active_memory(&after));
+    const ring: usize = RING_ROWS * @as(usize, @intCast(width)) * 2;
+    std.testing.expect(after -| before <= ring + ring / 4) catch |err| {
+        std.debug.print("mimo mtp hidden ring holds {d} B, ring is {d} B\n", .{ after -| before, ring });
+        return err;
+    };
 }
 
 test "mimo mtp heads track the torch rendering of the MiMo-V2 MTP layer across rounds, drafts and rollbacks (MIMO_V2_MODEL + MIMO_V2_MTP_FIXTURE)" {

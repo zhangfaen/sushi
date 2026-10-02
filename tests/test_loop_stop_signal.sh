@@ -50,14 +50,17 @@ check() {
 [ -d "$MODEL" ] || { echo "[skip] model not found: $MODEL (set LOOP_TEST_MODEL)"; exit 0; }
 
 LOG="$(mktemp)"
+SRV=""
 cleanup() {
-    pkill -f "sushi.*--port $PORT" 2>/dev/null
+    [ -n "$SRV" ] && kill "$SRV" 2>/dev/null
     rm -f "$LOG"
 }
 trap cleanup EXIT
 
-pkill -f "sushi.*--port $PORT" 2>/dev/null
-sleep 0.5
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    exit 1
+fi
 "$BINARY" --model "$MODEL" --serve --port "$PORT" --log-file off --log-level info > "$LOG" 2>&1 &
 SRV=$!
 for _ in $(seq 1 240); do

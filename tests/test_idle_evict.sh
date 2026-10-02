@@ -41,8 +41,10 @@ M="${MODELS[0]}"
 echo "  using $M"
 
 BINARY="${SUSHI_BINARY:-./zig-out/bin/sushi}"
-pkill -f "sushi.*--port $PORT" 2>/dev/null || true
-sleep 1
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    exit 1
+fi
 LOGFILE=$(mktemp)
 # 2s window: idleEvictTickMs floors the sweep at 1s, so eviction lands ~3s after
 # the last request instead of making the test wait out a realistic window.
@@ -151,7 +153,7 @@ if [ "$FAIL" = "0" ] && [ -n "$BASE_RSS" ]; then
 fi
 
 # Default off: the same binary with no flag must keep the model resident.
-pkill -f "sushi.*--port $PORT" 2>/dev/null || true
+kill $SERVER_PID 2>/dev/null || true
 wait $SERVER_PID 2>/dev/null || true
 "$BINARY" --model-dir "$ROOT" --serve --port "$PORT" ${SUSHI_TEST_EXTRA_ARGS:-} > "$LOGFILE" 2>&1 &
 SERVER_PID=$!

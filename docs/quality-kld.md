@@ -41,7 +41,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [perf-baselines](perf-base
 | Flash-Next 16x512 raw | Flash-Next | the bf16 checkpoint, bf16 stream, raw text; the standard |
 | Flash-Next 16x512 raw, f32 stream | Flash-Next | the same with an f32 residual stream |
 | Flash-Next 60x64 | Flash-Next | the 60x64 screen |
-| MiMo 16x512 raw | MiMo | original checkpoint as stored (FP8 trunk: bf16 weights in prefill, FP8 code x f32 block scale in decode), dense KV; recaptured 2026-09-25 by 35a854c7 (its forward is unchanged at 2c4dd91e); mean strict NLL 0.2665; 623 s capture |
+| MiMo 16x512 raw | MiMo | the MOPD checkpoint as stored (FP8 trunk: bf16 weights in prefill, FP8 code x f32 block scale in decode), dense KV; captured 2026-09-30 by 83dc9b6c; mean strict NLL 0.2664; 652 s capture |
 
 Commands (MiMo; Flash-Next drops `--ssd-budget-gb` when the source fits):
 
@@ -68,6 +68,35 @@ Both are heavy GPU jobs: take the lock per run (CLAUDE.md, Team process).
   stored-affine trunk (served packs only) leaves the teacher untouched.
 - `SUSHI_NGRAM_BF16_DIR=<hf checkpoint>` serves a Flash-Next pack with the original bf16 n-gram table to isolate
   the PLE table's cost.
+
+## Lossy expert pick
+
+`--expert-pick-tolerance` on Sushi-2bpw, `--ssd-budget-gb 20` (251 slots/layer), kv8, 16 prompts x 128 tokens,
+teacher = the same pack with exact routing (`kld compare --expert-pick-tolerance n`).
+
+| tolerance | KLD | top-1 | NLL | KLD to first EOS | cache hit |
+|---|---|---|---|---|---|
+| 0 | 0 | 100% | 0.4004 | 0 | 81.6% |
+| 0.2 | 0.0216 | 94.5% | 0.4174 | 0.0298 | 83.2% |
+| 0.3 | 0.0264 | 93.7% | 0.4272 | 0.0355 | 83.8% |
+
+The pack's own KLD against the bf16 teacher is 0.208, so 0.2 adds about a tenth of it. The GPU-side pick reads the
+same KLD to the ninth digit (0.021600648): it picks exactly what the host picks.
+
+Repetition: 8 prompts x 600 tokens at temperature 0 and 1, tolerance 0 / 0.2 / 0.3: mean distinct 4-grams 0.997-0.999
+in every arm (worst run 0.983), no loop-stop cut in any of the 48 runs.
+
+<a id="lossy-expert-pick-mimo"></a>
+MiMo (sigmoid router: the pick compares sigmoid probabilities), the MOPD checkpoint (MXFP4 experts) streamed at
+`--ssd-budget-gb 60` (81 slots/layer), kv8, 16x512 raw, teacher = the same load with exact routing captured on this
+binary (built at cf23043d, the landed change's pick code; strict NLL 0.2609, cache hit 84.6%):
+
+| tolerance | KLD (to first EOS) | top-1 | NLL | cache hit | ids swapped |
+|---|---|---|---|---|---|
+| 0.2 | 0.00958 | 97.2% | 0.2725 | 92.9% | 7.7% |
+
+Decode at a 4k prompt (llmprobe 0.6.12, `--no-mtp`, one boot each): 5.8 tok/s exact, 10.5 at 0.2
+([perf-baselines](perf-baselines.md#mimo-stream-pick)).
 
 ## Cross-engine check
 
@@ -162,8 +191,11 @@ NLL 0.465802 against kv8's 0.135508 / 89.08% / 0.454090, +7.63% KLD and -0.24 pp
 <a id="mimo"></a>
 ## MiMo (16x512, first EOS, student kv8)
 
-MiMo-V2.6-Flash-Sushi-2.25bpw lands here once measured against the 2026-09-25 teacher (8099 positions). That capture
-replaced the 2026-09-23 teacher (8037 positions); the two generate different continuations (mean strict NLL 0.278
-against 0.2665), so readings against the two are not comparable.
+| pack | KLD | top-1 | positions | binary |
+|---|---|---|---|---|
+| MiMo-V2.6-Flash-Sushi-2.3bpw | 0.0860 | 91.95% | 8067 | 83dc9b6c (v1.1.0 gate) |
+
+Against the 2026-09-30 MOPD teacher. Readings against an earlier teacher capture generate different continuations and
+are not comparable.
 
 The FP8-native teacher against the bf16-rounded teacher: 0.0034 nats.

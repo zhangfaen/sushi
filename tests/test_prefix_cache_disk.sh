@@ -44,10 +44,12 @@ if [ ! -x "$BINARY" ]; then
     exit 1
 fi
 
-pkill -f "sushi.*--port $PORT" 2>/dev/null || true
-sleep 1
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    exit 1
+fi
 
-# Isolated HOME so the test never touches the user's real kv-cache.
+# Isolated cache roots leave the user's cache and home settings untouched.
 SCRATCH_HOME=$(mktemp -d)
 HYBRID_HOME=$(mktemp -d)
 LOGFILE=$(mktemp)
@@ -66,7 +68,7 @@ start_server() { # extra args...
     # 5's `--prefix-cache-disk off` still wins (last flag parses last).
     # SERVER_ULIMIT_N lowers the server's soft open-file limit.
     ( [ -n "${SERVER_ULIMIT_N:-}" ] && ulimit -n "$SERVER_ULIMIT_N"
-      HOME="$SCRATCH_HOME" exec "$BINARY" --model "$MODEL" --serve --port "$PORT" \
+      SUSHI_PREFIX_CACHE_DIR="$SCRATCH_HOME/.sushi/kv-cache" exec "$BINARY" --model "$MODEL" --serve --port "$PORT" \
         --ctx-size 8192 --no-pld --log-level info --prefix-cache-disk 4GB "$@" ) > "$LOGFILE" 2>&1 &
     SERVER_PID=$!
     for i in $(seq 1 90); do
@@ -206,7 +208,47 @@ fi
 stop_server
 
 echo
-echo "== 6. hybrid SSM arch (Qwen 3.5 GatedDeltaNet) persists + restores SSM state =="
+echo "== 6. SSD-only mode persists without RAM retention =="
+rm -rf "$KV_DIR"
+start_server --no-prefix-cache-ram || { echo -e "${RED}FAIL${NC} SSD-only server failed to start"; exit 1; }
+fire_long > /dev/null
+sleep 1
+if grep -q 'Prefix cache: SSD ONLY' "$LOGFILE" &&
+   grep -q '\[disk-cache\] e[0-9][0-9]* complete on disk' "$LOGFILE"; then
+    echo -e "${GREEN}PASS${NC} SSD-only mode persisted a complete prefix"
+else
+    echo -e "${RED}FAIL${NC} SSD-only mode did not persist a complete prefix"
+    tail -30 "$LOGFILE"; FAIL=1
+fi
+stop_server
+start_server --no-prefix-cache-ram || { echo -e "${RED}FAIL${NC} SSD-only restart failed"; exit 1; }
+curl -fsS "$BASE/v1/unload-model" -H 'Content-Type: application/json' -d '{"model":"sushi"}' > /dev/null
+jq -nc --arg model "$MODEL" '{model:$model}' |
+    curl -fsS "$BASE/v1/load-model" -H 'Content-Type: application/json' --data-binary @- > /dev/null
+curl -fsS "$BASE/props" | jq -e '.settings.prefix_cache | .ram_enabled == false and .mem_bytes == 0' > /dev/null
+fire_long > /dev/null
+if grep -q '\[disk-cache\] restored .* tokens from SSD' "$LOGFILE" &&
+   ! grep -q '\[hot-cache\] resident=' "$LOGFILE"; then
+    echo -e "${GREEN}PASS${NC} SSD-only restart restored with no hot-cache residency"
+else
+    echo -e "${RED}FAIL${NC} SSD-only restart did not restore cleanly"
+    tail -30 "$LOGFILE"; FAIL=1
+fi
+stop_server
+
+echo "  -- zero entries disables all reuse even with SSD configured --"
+start_server --prefix-cache-entries 0 || { echo -e "${RED}FAIL${NC} cache-off server failed"; exit 1; }
+fire_long > /dev/null
+if grep -q '\[disk-cache\]\|\[hot-cache\] reused' "$LOGFILE"; then
+    echo -e "${RED}FAIL${NC} zero entries still reused or wrote prefixes"; FAIL=1
+else
+    echo -e "${GREEN}PASS${NC} zero entries disables both tiers"
+fi
+stop_server
+
+echo
+
+echo "== 7. hybrid SSM arch (Qwen 3.5 GatedDeltaNet) persists + restores SSM state =="
 # Phase 3: hybrid recurrent archs persist their per-position SSM checkpoints
 # beside the KV chunks and restore both across a restart. Gated on a local
 # Qwen3.5-0.8B; SKIPs cleanly otherwise (the attention sections above cover the
@@ -216,7 +258,7 @@ HYBRID_MODEL="${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-
 if [ ! -d "$HYBRID_MODEL" ]; then
     echo -e "${YELLOW}SKIP${NC} hybrid section: Qwen3.5-0.8B-MLX-4bit not found."
 else
-    # Repoint the server helpers at the hybrid model + a fresh isolated HOME.
+    # Repoint the server helpers at the hybrid model + a fresh isolated cache root.
     MODEL="$HYBRID_MODEL"
     SCRATCH_HOME="$HYBRID_HOME"
     KV_DIR="$SCRATCH_HOME/.sushi/kv-cache"
@@ -271,7 +313,7 @@ else
 fi
 
 echo
-echo "== 7. a restore wider than the fd limit, and a failed restore's fallback =="
+echo "== 8. a restore wider than the fd limit, and a failed restore's fallback =="
 # A restore reads one chunk file per 1024 tokens. It must fit under a soft
 # RLIMIT_NOFILE smaller than its chunk count, and an unreadable chunk must
 # fall back to a cold prefill that answers 200.

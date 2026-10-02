@@ -14,7 +14,10 @@ if [ ! -x "$BINARY" ]; then
     echo "FAIL $BINARY missing — build first"
     exit 1
 fi
-pkill -f "sushi.*--port $PORT" 2>/dev/null || true
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    exit 1
+fi
 prompt_of() {
     python3 -c "print(('The history of computing. ' * int($1 * 4))[:int($1 * 16)])"
 }
@@ -72,7 +75,6 @@ run_arm() {
     grep -E '\[batched\].*engaged|\[qsa-batched-gather\] engaged|\[qsa-arms\]|\[qsa-decode-gather\]|\[qsa-verify-gather\]' "$log" || true
     kill $pid 2>/dev/null || true
     wait $pid 2>/dev/null || true
-    pkill -f "sushi.*--port $PORT" 2>/dev/null || true
     for i in $(seq 1 30); do
         lsof -nP -iTCP:$PORT -sTCP:LISTEN >/dev/null 2>&1 || break
         sleep 1

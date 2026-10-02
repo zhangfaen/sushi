@@ -6,18 +6,21 @@
 # row that entry's ring kept, and cold-prefilled the conversation every turn. Pins, thinking on:
 #
 #  1. main turn, side request, an unrelated request evicting the main entry (two hot entries):
-#     the next main turn restores from the side entry's inherited ring checkpoint, in RAM.
+#     the next main turn restores from the side entry in RAM. The unrelated request's own lookup
+#     declines at the ring clamp and must not promote the entry it declined on.
 #  2. The SSD tier persists ringed entries as chunks plus ring files (manifest v9).
 #  3. After a restart the same main turn restores from the SSD tier, and its logprobs match the
 #     RAM-restored run within 0.5 nats up to any flip; a turn diverging at the reminder then restores
 #     too (from either tier).
+#  4. Both main turn 2 restores land past the reply: at the message start the side request's
+#     prefill marked (a ring file at that position after the restart), not at turn 1's prompt end.
 #
 # Each boot takes the GPU lock (scripts/gpu-lock.sh, owner GPU_LOCK_OWNER).
 # Env: SUSHI_MODELS_DIR (default $HOME/.sushi/models), MIMO_MODEL, PORT (default 18931), BINARY.
 
 set -uo pipefail
 
-MODEL="${MIMO_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.5bpw}"
+MODEL="${MIMO_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.3bpw}"
 PORT="${PORT:-18931}"
 BIN="${BINARY:-./zig-out/bin/sushi}"
 BASE="http://127.0.0.1:$PORT"
@@ -116,9 +119,11 @@ ask "$(title)" > /dev/null || { echo "fail: unrelated request"; tail -20 "$LOG";
 DECLINE0=$(count 'declined: SlidingRingRewindPastWindow')
 M2=$(ask "$(after "$Q2" 300)") || { echo "fail: main turn 2"; tail -20 "$LOG"; exit 1; }
 RING2=$(count '\[hot-cache\] ring checkpoint @')
-[ "$RING2" -gt "$RING1" ] || fail "main turn 2 did not restore from the side entry's inherited checkpoint"
+[ "$RING2" -gt "$RING1" ] || fail "main turn 2 did not restore from the side entry in RAM"
 [ "$(count 'declined: SlidingRingRewindPastWindow')" = "$DECLINE0" ] || fail "main turn 2 declined its clamp"
 [ "$(field "$M2" .timings.cached_n)" -gt 0 ] || fail "main turn 2 cold-prefilled"
+P1=$(field "$M1" .usage.prompt_tokens)
+[ "$(field "$M2" .timings.cached_n)" -gt "$P1" ] || fail "main turn 2 restored at or below turn 1's prompt end, not at the side request's mark"
 echo "main turn 2 (RAM): cached_n=$(field "$M2" .timings.cached_n) prompt_ms=$(field "$M2" .timings.prompt_ms) of $(field "$M2" .usage.prompt_tokens) prompt tokens"
 
 # The flush runs after the response: wait for the three long entries (the title request is under
@@ -142,6 +147,7 @@ DISK0=$(count '\[disk-cache\] restored .*ring@')
 M2D=$(ask "$(after "$Q2" 300)") || { echo "fail: main turn 2 after restart"; tail -20 "$LOG"; exit 1; }
 [ "$(count '\[disk-cache\] restored .*ring@')" -gt "$DISK0" ] || fail "main turn 2 after restart did not restore from SSD"
 [ "$(field "$M2D" .timings.cached_n)" -gt 0 ] || fail "main turn 2 after restart cold-prefilled"
+[ "$(field "$M2D" .timings.cached_n)" -gt "$P1" ] || fail "main turn 2 after restart restored at or below turn 1's prompt end"
 echo "main turn 2 (SSD): cached_n=$(field "$M2D" .timings.cached_n) prompt_ms=$(field "$M2D" .timings.prompt_ms)"
 DRIFT=$(python3 - "$M2" "$M2D" <<'PY'
 import json, sys

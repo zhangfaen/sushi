@@ -6,44 +6,96 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
-- Sushi-3bpw and Sushi-4bpw ship new expert weights on Hugging Face: Sushi-4bpw KLD 0.0632 -> 0.0592, Sushi-3bpw 0.1047 -> 0.1036 (each with the n-gram table it ships).
+- **`sushi launch omp` lets local buffered tool calls finish without the default five-minute retry**; the generated
+  Sushi provider disables its model-progress deadline while preserving explicit user timeout overrides.
 
-- `/metrics.json` `sessions` also lists each hot-cache conversation no live request holds as a `cached` row, and `/props` reports `memory.kv_cache_bytes` including live requests (mlx-serve 4e00f2af and eca42620 (#590), thanks @ddalcu; builds on #13, thanks @yoyo930021).
+- **Long-context MiMo requests switch to serial decode when their MTP rounds lose on measured cost**, while
+  workloads that benefit from speculation keep it.
+- **Experimental token logit biases**: load scoped penalties and rewards from JSON/CSV with `--logit-bias-file`,
+  or send an OpenAI `logit_bias` map per request; the optional think-penalty preset remains off by default.
 
-- **Per-request live sessions on `/metrics.json`**: every in-flight request publishes its phase, context tokens
-  against the model's effective limit, cached and generated tokens, its `max_tokens`, a poll-stable `request_id`,
-  its age and the GPU bytes its KV/SSM state holds — refreshed at each decode cull, prefill entry and interleave
-  chunk boundary (mlx-serve sessions publish chain after `4e00f2af` (live KV residency), thanks @ddalcu;
-  mlx-serve #590).
+- **Faster MiMo 2.3bpw**: the prefill's expert GEMMs, the MTP verify rows (whose global layers share one walk of a
+  long cache), the draft heads and long-prompt attention do less work per token; output is byte-identical.
+- **Faster Qwen3.8-Flash-Next prefill**: the expert routing table is built on the GPU and the expert outputs are
+  reduced in place, with no host round trip or un-sort copy per layer; output is byte-identical.
+- **MiMo echoes and edits of a file in context decode faster**: prompt lookup now runs inside MiMo's MTP rounds, and a
+  lookup or PLD round verifies up to seven drafts; output is byte-identical.
+- **`sushi run mimo-v2.6-flash`** (and `sushi pull`) fetches and serves the MiMo 2.3bpw pack by its short name.
+- **Greedy MiMo decode reads the vocabulary head through a coarse top-32 shortlist** re-scored on the full head,
+  with or without MTP, and on a streamed MiMo too; sampled, logprob, penalty and grammar requests keep the full head.
+- **`--gpu-warm-secs <n>`** (default 60, 0 = off): the server keeps the GPU awake for this long after a request, so
+  the next request no longer starts with a GPU wake-up delay.
+- **With MTP, the first token streams when prefill ends** instead of after the first speculative round (when that
+  token is visible: a template-opened thought or thinking off).
+- **Faster SSD streaming**: a streamed decode layer queues its experts from a GPU copy of the expert cache map
+  before the host reads the router ids, and verifies them one layer later; Sushi-2bpw at a 20 GB budget on an M1 Max
+  decodes 10.3 -> 19.6 tok/s (llmprobe, 512 context) with byte-identical output.
+- **`--expert-pick-tolerance <n>`** (0 to 0.6, default off): a streamed pack may serve a cached expert in place of a
+  missed one when the router rates it at least `1 - n` as likely; lossy, trading a little accuracy for fewer SSD reads (KLD in `docs/quality-kld.md`; 22.3 tok/s greedy at 0.2 on the same
+  M1 Max); on a streamed MiMo it compares the sigmoid router's probabilities (5.8 -> 10.5 tok/s at 0.2 with a 60 GB
+  budget on an M5 Max).
+- **A reply cut short while thinking streams the reasoning the non-streamed reply returns**: no lone `<think>` as
+  reasoning (MiMo at `max_tokens: 1`), no empty Anthropic thinking block, and no dropped thought of a few characters.
+- **The MiMo pack loads on demand on a 128 GB Mac at default flags** (the app's path): the automatic resident-memory
+  cap now limits only models sharing memory, and a model loading alone is judged by the load's own memory check; an
+  explicit `--max-resident-mem` still applies.
+- **`presence_penalty`, `frequency_penalty` and `repeat_penalty` take effect**: the default decode path and MTP
+  ignored them; a penalised request now decodes serially, so it is slower than an unpenalised one.
+- **A request that names a pack by its path is answered by that pack or refused**: an unregistered path is a 404
+  instead of an answer from the default model; unknown model names still fall back to the default.
+- **A new MiMo session that shares only another's system prompt and tools reuses them from the prefix cache**
+  instead of prefilling them again (a subagent, a second chat).
+- **MiMo prefills long prompts in 2048-token chunks by default** (`--prefill-chunk 4096` raises it back), and the
+  load line now says each request picks its own chunk width, with the load-time width only a fallback.
+- **`ignore_eos: true`** on a `/v1/completions` request decodes past the end-of-sequence token up to `max_tokens`,
+  as in vLLM; a chat request that sets it gets a 400 naming the field.
+- **A reasoning budget closes the thought on time when several requests decode at once**; batched, a thought could
+  run thousands of tokens past it.
+- **A Flash-Next turn restored from the SSD prompt cache is no longer billed as if its restored prefix were new**,
+  so a long session after a restart is admitted where that bill refused it.
+- **A malformed `config.json` is refused by name** (a wrong field type, a negative or oversized number) instead of
+  loading undefined values; model discovery skips one whose top level is not an object.
+- **Concurrent MiMo requests decode together** in one forward of up to four streams; crowded MTP requests retain
+  their head state and resume solo rounds, with the same output as each alone.
 
-- A prompt-lookup draft is accepted with the exact rule under `--mtp-typical` and `--mtp-tokenv3`, so sampled replies no longer echo their context until the loop guard cuts them (mlx-serve #614, thanks @STRML).
+---
 
-- `--prompt` (also `-p` and `run <model> -p`) honors thinking, sampling and generation flags, then exits after one reply.
+## v1.1.1 — Long MiMo prompts and agent sessions
 
-- `--prefill-decode-share` reserves a target share of prefill wall time for active decoders and narrows prefill chunks while they run (mlx-serve #568, thanks @STRML).
+- **MiMo long prompts are admitted again**: a resident MiMo server now sizes requests against the GPU limit you set
+  (`iogpu.wired_limit_mb`), not against what other apps happen to leave free, so a long agent session no longer gets
+  "requires ~N MB GPU memory" on a 768k server; the prompt cache gives its memory back to a request that needs it.
+- **`--prefill-chunk` is a maximum**: a request that does not fit at your chunk steps down to a narrower one instead
+  of being refused. 2048 is the recommended value; wider chunks cost memory without prefilling faster.
+- **Warm agent turns stop spiking memory**: a turn that reuses the cached conversation grows its KV buffers during the
+  prefill, one layer at a time, instead of all at once on the first reply token, so long agent sessions stay admitted.
+- **Claude Code on a local model**: `sushi launch claude` keeps each turn on one streamed request, and a request whose
+  client disconnects now stops generating instead of running on for nobody.
+- **Homebrew gets each release right away**: `brew upgrade sushi` sees a new version as soon as it is published.
 
-- Batched Qwen4 decode overlaps GPU execution with graph construction through a PLE-safe async ladder; serial decode stays off by default (mlx-serve #584, thanks @cowboycoderhq).
+---
 
-- Two-row Qwen4 MTP verification folds GDN normalization, gating and rollback history into the recurrence without changing output (mlx-serve #558, thanks @STRML).
+## v1.1.0 — MiMo-V2.6-Flash and SSD streaming
 
-- SSD prompt-cache accounting retains existing QSA files across in-place commits (mlx-serve #601, thanks @brandondyal).
-- Rescanning models clears a failed load when its directory is still present, allowing a retry (mlx-serve #550, thanks @brandondyal).
-- JSON-constrained replies return logprobs paired with their emitted tokens (mlx-serve #552, thanks @brandondyal).
-- Quantized KV retains f16 or bf16 activations through cache growth and reconstruction (mlx-serve #553, thanks @jasontitus).
-
-- **sushi updates itself**: `sushi update` installs the newest release after checking its SHA-256, its signature and
-  that it runs, keeping the old install for `sushi update --rollback`; a server checks for a release once a day
-  (`--no-update-check` turns that off), and the chat page and `sushi run`'s `/update` install it and restart.
-- **SSD prompt-cache restores stay at one copy**: a restore no longer copies the whole restored cache at a chunk when
-  the GPU releases finished work late, which could hold up to three copies of it at once.
-- **`--mtp-greedy-tail`**: beside `--mtp-typical`, sampled decoding drafts its later speculative tokens by argmax
-  for faster output at slightly more predictable text; off by default, or per model with `"mtp_greedy_tail": true`
-  in model-settings.json.
-- **Install with Homebrew**: `brew install beamivalice/tap/sushi`; a Homebrew install updates with
-  `brew upgrade sushi`, which `sushi update`, the chat page and `/update` name instead of replacing its files.
-- **`--fast`** turns on the fastest settings in one flag: MTP with typical acceptance and the greedy tail, and 8-bit
-  KV. It trades a little sampling fidelity for speed (greedy requests are unchanged), and any of those flags given
-  beside it wins.
+- **MiMo-V2.6-Flash**: sushi's second model. `MiMo-V2.6-Flash-Sushi-2.3bpw` serves text and image input from one
+  resident pack with native MTP, up to its full 1M-token context on a 128 GB Mac.
+- **Sushi packs stream from SSD**: `--ssd-budget-gb N` keeps the trunk resident and streams the routed experts from
+  SSD, so a Mac with less memory than the pack can serve it; replies are identical to a resident load. Every Sushi
+  Qwen pack and MiMo-V2.6-Flash-Sushi-2.3bpw stream, and Sushi-2bpw serves on a 32 GB M1 Max at a 20 GB budget.
+- **Faster Flash-Next**: on an M5 Max, Sushi-4bpw decodes 8% faster (83 -> 89 tok/s) and prefills a 10k-token prompt
+  19% faster (1,796 -> 2,139 tok/s). oMLX's tensor-unit sparse attention now serves prefill from the first sparse
+  chunk, GDN prefill runs a software-pipelined recurrence, batched decode overlaps GPU work with graph building, and
+  `--prefill-decode-share` keeps decoders moving while a long prompt prefills. Thanks @STRML and @cowboycoderhq.
+- **Better and smaller packs**: new expert weights for Sushi-4bpw (KLD 0.0632 -> 0.0592) and Sushi-3bpw
+  (0.1047 -> 0.1036), and Sushi-2bpw for 48 GB Macs.
+- **Live sessions on `/metrics.json`**: every in-flight request and every cached conversation, with its phase,
+  context against the model's limit and the GPU memory its KV holds. Thanks @yoyo930021 and @ddalcu.
+- **Updates itself**: `sushi update` installs the newest release after checking its SHA-256 and signature and keeps
+  the old one for `--rollback`; a daily check, one-click update from the chat page, or `brew install
+  beamivalice/tap/sushi`.
+- **Fixes**: MiMo long-context memory returns to the OS, SSD prompt-cache restores keep one copy, JSON-constrained
+  logprobs pair with their tokens, and a failed model load can be retried after a rescan. Thanks @brandondyal and
+  @jasontitus; the EXL3 engine is now a module mlx-serve builds against, thanks @ddalcu.
 
 ---
 

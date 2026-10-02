@@ -27,7 +27,10 @@ BINARY="${BINARY:-./zig-out/bin/sushi}"
 [[ -x "$BINARY" ]] || { echo "Build first" >&2; exit 1; }
 [[ -d "$MODEL_DIR" ]] || { echo "SKIP: no model at $MODEL_DIR (pass a dir as \$1)"; exit 0; }
 
-trap 'pkill -9 -x sushi 2>/dev/null; true' EXIT
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    exit 1
+fi
 
 # Long shared system prompt (250+ tokens) so prefill cost is significant.
 SYSTEM_PROMPT="You are an expert software engineer assistant. You provide concise, technically correct answers. You explain trade-offs when relevant. You always cite specific function names, file paths, or line numbers when discussing code. You prefer concrete examples over abstract advice. You do not pad your answers with hedges or apologies. You assume the user is also a software engineer. You write in Markdown when formatting helps. You keep code blocks small and self-contained. You ask clarifying questions only when truly necessary. You favor depth over breadth in your explanations. You show your reasoning when it would help the reader."
@@ -72,12 +75,12 @@ call_and_time() {
 
 run_with_capacity() {
     local cap="$1"
-    pkill -9 -x sushi 2>/dev/null
-    sleep 1
 
     "$BINARY" --model "$MODEL_DIR" --serve --port "$PORT" --ctx-size 4096 \
         --prefix-cache-entries "$cap" --log-level info > /tmp/test_prefix_cache.log 2>&1 &
     local pid=$!
+    # Called inside $(...): the subshell's own EXIT trap is the only one that knows this pid.
+    trap "kill -9 $pid 2>/dev/null" EXIT
     for _ in $(seq 1 240); do
         curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
         sleep 0.5
@@ -99,8 +102,8 @@ run_with_capacity() {
     a2=$(call_and_time "$(build_body_multiturn "$SYSTEM_PROMPT" "$CONVO_A_USER1" "$fake_assistant_a" "$CONVO_A_USER2")")
     b2=$(call_and_time "$(build_body_multiturn "$SYSTEM_PROMPT" "$CONVO_B_USER1" "$fake_assistant_b" "$CONVO_B_USER2")")
 
-    pkill -9 -x sushi 2>/dev/null
-    sleep 1
+    kill -9 "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
     echo "$a1 $b1 $a2 $b2"
 }
 

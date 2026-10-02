@@ -16,8 +16,11 @@ IMAGE="tests/fixtures/house.jpeg"
 if [ ! -f "$MODEL/config.json" ]; then echo "SKIP: model not found at $MODEL"; exit 0; fi
 if [ ! -f "$IMAGE" ]; then echo "SKIP: fixture $IMAGE missing"; exit 0; fi
 
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    exit 1
+fi
 LOG=$(mktemp)
-pkill -f "sushi.*--port $PORT" 2>/dev/null; sleep 1
 ./zig-out/bin/sushi --model "$MODEL" --serve --port "$PORT" --log-level info > "$LOG" 2>&1 &
 SRV=$!
 cleanup() { kill "$SRV" 2>/dev/null; }

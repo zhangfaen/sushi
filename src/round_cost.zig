@@ -10,7 +10,7 @@
 //! cold-start prior.
 //!
 //! Width = drafts per round (MTP depth m; DFlash block_size - 1; 0 = serial).
-//! Buckets = KV length at the round: <2k, 2-4k, 4-8k, 8-16k, 16-32k, 32k+.
+//! Buckets = KV length at the round, on the layout's grid (`Layout`).
 //! Each cell holds an EMA of round ms AND an EMA of emitted tokens — cost is
 //! never stored without the tokens it bought.
 //!
@@ -24,18 +24,22 @@ const transformer_mod = @import("transformer.zig");
 
 /// Drafts per round the table covers (MTP depth <= 8, a DFlash block up to 16); index 0 is serial.
 pub const MAX_WIDTH: u32 = 16;
-/// KV buckets. The long grid splits the old unbounded `32k+` cell at 64k/128k/256k.
-pub const N_BUCKETS: usize = 9;
-const BUCKET_EDGES = [_]u32{ 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144 };
+/// KV buckets. The long grid splits the old unbounded `32k+` cell at 64k/128k/256k; the
+/// full-attention grid goes on to 512k and 768k.
+pub const N_BUCKETS: usize = 11;
+const BUCKET_EDGES = [_]u32{ 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 786432 };
 pub const BUCKET_NAMES = [N_BUCKETS][]const u8{
-    "<2k",    "2-4k",    "4-8k",     "8-16k", "16-32k",
-    "32-64k", "64-128k", "128-256k", "256k+",
+    "<2k",     "2-4k",     "4-8k",     "8-16k", "16-32k", "32-64k",
+    "64-128k", "128-256k", "256-512k", "512-768k", "768k+",
 };
 
-/// The label for bucket `b` under `layout`: the grids disagree about bucket 5 (`32k+` on legacy).
+/// The label for bucket `b` under `layout`: a grid's top bucket is open-ended.
 pub fn bucketName(layout: Layout, b: usize) []const u8 {
-    const n = nBuckets(layout);
-    if (b + 1 == n and n < N_BUCKETS) return "32k+";
+    if (b + 1 == nBuckets(layout)) return switch (layout) {
+        .legacy => "32k+",
+        .long => "256k+",
+        .full_attention => "768k+",
+    };
     return BUCKET_NAMES[b];
 }
 
@@ -48,19 +52,25 @@ pub const Layout = enum {
     legacy,
     /// Nine buckets (64k/128k/256k edges) + the serial row. Store version 3.
     long,
+    /// The long grid plus 512k and 768k edges: a round that attends every key (MiMo's global
+    /// layers) costs about twice as much at 1M as at 512k, and one cell spanning both read
+    /// the longer rung's rounds as implausible. Store version 4.
+    full_attention,
 };
 
 /// The one resolver for a model's layout; the layout decides the store version and so
 /// which persisted file a model reads. `anytype`: this module imports nothing but std.
 pub fn layoutFor(config: anytype) Layout {
-    return if (config.isQwen4()) .long else .legacy;
+    if (config.isQwen4()) return .long;
+    return if (config.isMimo()) .full_attention else .legacy;
 }
 
 /// Buckets the layout uses; cells past it are never written and never active.
 pub fn nBuckets(layout: Layout) usize {
     return switch (layout) {
         .legacy => 6,
-        .long => N_BUCKETS,
+        .long => 9,
+        .full_attention => N_BUCKETS,
     };
 }
 
@@ -813,6 +823,52 @@ pub const WidthChooser = struct {
     }
 };
 
+// ── Stalls ───────────────────────────────────────────────────────────────
+
+/// One request's round walls, judged when it ends. The table drops a slow round quietly; this
+/// names it, so an info-level log can show a smooth run.
+pub const RoundLog = struct {
+    pub const CAP: usize = 1024;
+    /// A round slower than this multiple of the median round at its width is a stall.
+    pub const STALL_FACTOR: f32 = 2.0;
+
+    wall_ms: [CAP]f32 = undefined,
+    width: [CAP]u8 = undefined,
+    n: usize = 0,
+
+    pub const Stalls = struct { count: u32 = 0, max_ms: f32 = 0 };
+
+    pub fn add(self: *RoundLog, width: u32, wall_ms: f32) void {
+        if (self.n == CAP or width > MAX_WIDTH) return;
+        self.wall_ms[self.n] = wall_ms;
+        self.width[self.n] = @intCast(width);
+        self.n += 1;
+    }
+
+    /// A width with fewer than MIN_SAMPLES rounds has no median to judge against.
+    pub fn stalls(self: *const RoundLog) Stalls {
+        var out = Stalls{};
+        var walls: [CAP]f32 = undefined;
+        for (0..MAX_WIDTH + 1) |w| {
+            var k: usize = 0;
+            for (self.width[0..self.n], self.wall_ms[0..self.n]) |rw, ms| {
+                if (rw != w) continue;
+                walls[k] = ms;
+                k += 1;
+            }
+            if (k < MIN_SAMPLES) continue;
+            std.sort.pdq(f32, walls[0..k], {}, std.sort.asc(f32));
+            const bar = STALL_FACTOR * walls[k / 2];
+            for (walls[0..k]) |ms| {
+                if (ms <= bar) continue;
+                out.count += 1;
+                out.max_ms = @max(out.max_ms, ms);
+            }
+        }
+        return out;
+    }
+};
+
 // ── Persistence ──────────────────────────────────────────────────────────
 //
 // Knowledge is per (chip, model, quant, OS build, engine build): the same
@@ -832,6 +888,7 @@ pub fn storeVersion(layout: Layout) u32 {
     return switch (layout) {
         .legacy => 1,
         .long => 3,
+        .full_attention => 4,
     };
 }
 
@@ -1037,8 +1094,8 @@ pub fn serialize(buf: []u8, t: *const Table) ![]const u8 {
             try w.print("{d} {d} {d:.4} {d:.4} {d}\n", .{ wi, b, c.ms, c.tok, c.n });
         }
     }
-    // The serial row is v3-only; an `s` line in an rc1 file would read as width `s` to an older build.
-    if (t.layout == .long) {
+    // No serial row on the legacy grid; an `s` line in an rc1 file would read as width `s` to an older build.
+    if (t.layout != .legacy) {
         for (t.serial, 0..) |c, b| {
             if (c.n == 0) continue;
             try w.print("s {d} {d:.4} {d:.4} {d}\n", .{ b, c.ms, c.tok, c.n });
@@ -1070,7 +1127,7 @@ pub fn parse(text: []const u8, layout: Layout) ?Table {
         const n = std.fmt.parseInt(u32, f.next() orelse return null, 10) catch return null;
         // Range is the layout's, not the array's.
         if (wi > MAX_WIDTH or b >= nBuckets(layout) or n == 0) return null;
-        if (is_serial and layout != .long) return null;
+        if (is_serial and layout == .legacy) return null;
         if (!std.math.isFinite(ms) or ms <= 0 or !(tok > 0)) return null;
         const cell = Cell{ .ms = ms, .tok = tok, .n = n, .last_seen = 0 };
         if (is_serial) t.serial[b] = cell else t.cells[wi][b] = cell;
@@ -1105,10 +1162,10 @@ fn readCached(allocator: std.mem.Allocator, io: std.Io, key: []const u8, layout:
     return parse(text, layout);
 }
 
-/// Lift a legacy table onto the long grid: buckets 0..4 share their edges and carry over;
-/// the legacy `32k+` cell spans three long cells and is dropped.
-pub fn migrateLegacy(src: Table) Table {
-    var t = Table{ .layout = .long };
+/// Lift a legacy table onto a wider grid: buckets 0..4 share their edges and carry over;
+/// the legacy `32k+` cell spans several of the wider grid's cells and is dropped.
+pub fn migrateLegacy(src: Table, layout: Layout) Table {
+    var t = Table{ .layout = layout };
     const shared = nBuckets(.legacy) - 1; // 0..4: identical edges
     for (src.cells, 0..) |row, wi| {
         for (row[0..shared], 0..) |c, b| t.cells[wi][b] = c;
@@ -1124,13 +1181,13 @@ pub fn migrateLegacy(src: Table) Table {
 pub fn loadCached(allocator: std.mem.Allocator, io: std.Io, key: []const u8, layout: Layout) ?Table {
     if (!persistEnabled()) return null;
     if (readCached(allocator, io, key, layout)) |t| return t;
-    if (layout != .long) return null;
+    if (layout == .legacy) return null;
     // The legacy file for the same (chip, model, quant, OS build) differs only in the prefix.
     if (key.len < 4) return null;
     var legacy_key_buf: [64]u8 = undefined;
     const legacy_key = std.fmt.bufPrint(&legacy_key_buf, "rc{d}-{s}", .{ storeVersion(.legacy), key[4..] }) catch return null;
     const old = readCached(allocator, io, legacy_key, .legacy) orelse return null;
-    return migrateLegacy(old);
+    return migrateLegacy(old, layout);
 }
 
 /// Best-effort: a machine that cannot write re-explores next boot.
@@ -1535,7 +1592,7 @@ test "round_cost: the legacy layout is the six-bucket grid, writes rc1 and reads
         try testing.expectEqual(bucketForLayout(kv, .long), bucketForLayout(kv, .legacy));
     }
     try testing.expectEqual(@as(usize, 6), nBuckets(.legacy));
-    try testing.expectEqual(N_BUCKETS, nBuckets(.long));
+    try testing.expectEqual(@as(usize, 9), nBuckets(.long));
 
     const legacy = Table{ .layout = .legacy };
     try testing.expectEqual(@as(usize, 5), legacy.bucketOf(400_000));
@@ -1577,7 +1634,7 @@ test "round_cost: the long layout warm-starts from a legacy file — no user boo
     }
     try testing.expectEqual(@as(usize, 5), legacy.bucketOf(400_000));
 
-    const lifted = migrateLegacy(legacy);
+    const lifted = migrateLegacy(legacy, .long);
     try testing.expectEqual(Layout.long, lifted.layout);
     try testing.expectApproxEqAbs(20.0, lifted.measuredMs(2, 0).?, 1e-3);
     try testing.expectApproxEqAbs(2.0, lifted.measuredTok(2, 0).?, 1e-3);
@@ -1585,7 +1642,7 @@ test "round_cost: the long layout warm-starts from a legacy file — no user boo
     try testing.expectApproxEqAbs(70.0, lifted.measuredMs(4, 4).?, 1e-3);
     try testing.expectEqual(@as(u32, 3), lifted.restored);
     // The legacy `32k+` cell spans three long cells and is dropped.
-    for (5..N_BUCKETS) |b| {
+    for (5..nBuckets(.long)) |b| {
         try testing.expect(lifted.measuredMs(3, b) == null);
         try testing.expect(!lifted.active(b));
     }
@@ -1600,8 +1657,12 @@ test "round_cost: the long layout warm-starts from a legacy file — no user boo
 test "layoutFor is THE round-cost layout resolver" {
     const Stub = struct {
         qwen4: bool,
+        mimo: bool = false,
         fn isQwen4(self: *const @This()) bool {
             return self.qwen4;
+        }
+        fn isMimo(self: *const @This()) bool {
+            return self.mimo;
         }
     };
     const long = Stub{ .qwen4 = true };
@@ -1609,6 +1670,30 @@ test "layoutFor is THE round-cost layout resolver" {
     try testing.expectEqual(Layout.long, layoutFor(&long));
     try testing.expectEqual(Layout.legacy, layoutFor(&legacy));
     try testing.expect(storeVersion(layoutFor(&long)) != storeVersion(layoutFor(&legacy)));
+}
+
+test "round_cost: a MiMo boot keeps each long-context rung's rounds in its own bucket" {
+    const Stub = struct {
+        fn isQwen4(_: *const @This()) bool {
+            return false;
+        }
+        fn isMimo(_: *const @This()) bool {
+            return true;
+        }
+    };
+    // Round walls from one MiMo Sushi-2.25bpw boot, kv8 (w1/w2/w3 = 1/2/3 drafts): the 32k
+    // request trusts all three widths, then the 128k request's w3 rounds cost 77 ms.
+    var t = Table{ .layout = layoutFor(&Stub{}) };
+    feed(&t, 1, 32_780, 35.3, 1.9);
+    feed(&t, 2, 32_790, 44.3, 2.6);
+    feed(&t, 3, 32_800, 58.3, 3.2);
+    try testing.expectEqual(Verdict.reseeded, t.observe(3, 131_100, 76.6, 3.1, true, false));
+    // A full-attention round keeps growing past 256k: 512k and 1M are separate prices.
+    feed(&t, 1, 524_400, 79.0, 1.9);
+    feed(&t, 2, 524_410, 111.0, 2.5);
+    try testing.expectEqual(Verdict.reseeded, t.observe(1, 1_003_600, 124.0, 1.9, true, false));
+    try testing.expectEqual(Verdict.reseeded, t.observe(2, 1_003_610, 179.0, 2.5, true, false));
+    try testing.expectEqual(@as(u32, 0), t.dropped_implausible);
 }
 
 test "bucketName: the legacy grid's top bucket is 32k+, not 32-64k" {
@@ -1769,6 +1854,44 @@ test "round_cost: persist write is a no-op when a diagnostic that adds barriers 
     try testing.expect(persistDiagArmedFrom(&.{ "0", "0", "0" }) == false);
     try testing.expect(persistDiagArmedFrom(&.{ null, "1", null }));
     try testing.expect(persistDiagArmedFrom(&.{ null, null, "5" }));
+}
+
+test "round_cost: RoundLog names the rounds that stalled, against the median of their own width" {
+    // One MiMo 32k request on a binary whose verify pipelines had never compiled: the first
+    // round at each width paid its JIT, and two later rounds stalled for ~100 ms.
+    const rounds = [_][2]u16{
+        .{ 1, 521 }, .{ 1, 35 }, .{ 1, 35 }, .{ 1, 35 }, .{ 1, 36 }, .{ 1, 35 }, .{ 1, 35 }, .{ 1, 55 }, .{ 2, 450 },
+        .{ 2, 47 }, .{ 3, 461 }, .{ 3, 52 }, .{ 3, 94 }, .{ 3, 81 }, .{ 3, 50 }, .{ 3, 57 }, .{ 2, 48 }, .{ 2, 47 },
+        .{ 2, 88 }, .{ 2, 47 }, .{ 3, 159 }, .{ 2, 44 }, .{ 2, 44 }, .{ 2, 44 }, .{ 2, 43 }, .{ 1, 36 }, .{ 1, 35 },
+        .{ 1, 35 }, .{ 1, 35 }, .{ 1, 35 }, .{ 1, 147 }, .{ 2, 43 }, .{ 2, 44 }, .{ 2, 43 }, .{ 2, 46 }, .{ 3, 56 },
+        .{ 3, 55 }, .{ 3, 55 }, .{ 3, 55 }, .{ 3, 58 }, .{ 3, 58 }, .{ 3, 57 }, .{ 3, 58 }, .{ 3, 60 }, .{ 3, 60 },
+        .{ 3, 58 }, .{ 3, 59 }, .{ 3, 58 }, .{ 3, 57 }, .{ 3, 57 }, .{ 3, 57 }, .{ 3, 58 }, .{ 3, 59 }, .{ 3, 58 },
+        .{ 3, 58 }, .{ 3, 59 }, .{ 3, 58 }, .{ 3, 58 }, .{ 3, 58 }, .{ 3, 59 }, .{ 3, 59 }, .{ 3, 58 }, .{ 3, 58 },
+        .{ 3, 57 }, .{ 3, 58 }, .{ 3, 59 }, .{ 3, 58 }, .{ 3, 57 }, .{ 3, 57 }, .{ 3, 57 }, .{ 3, 57 }, .{ 3, 57 },
+        .{ 3, 58 }, .{ 3, 59 }, .{ 3, 58 }, .{ 3, 59 }, .{ 3, 59 }, .{ 3, 60 }, .{ 3, 60 }, .{ 3, 58 }, .{ 3, 59 },
+        .{ 3, 59 }, .{ 3, 58 }, .{ 3, 59 }, .{ 3, 59 }, .{ 3, 60 }, .{ 3, 66 },
+    };
+    var log = RoundLog{};
+    for (rounds) |r| log.add(r[0], @floatFromInt(r[1]));
+    const s = log.stalls();
+    try testing.expectEqual(@as(u32, 5), s.count);
+    try testing.expectApproxEqAbs(@as(f32, 521), s.max_ms, 1e-3);
+
+    // A smooth request: two widths, a two-chunk round a sync slower, no stall.
+    var smooth = RoundLog{};
+    for (0..60) |i| smooth.add(3, 57.0 + @as(f32, @floatFromInt(i % 4)));
+    for (0..20) |_| smooth.add(1, 36.0);
+    smooth.add(3, 66.0);
+    try testing.expectEqual(RoundLog.Stalls{}, smooth.stalls());
+
+    // A width with too few rounds for a median is not judged; rounds past CAP are not kept.
+    var sparse = RoundLog{};
+    sparse.add(2, 45.0);
+    sparse.add(2, 400.0);
+    try testing.expectEqual(@as(u32, 0), sparse.stalls().count);
+    var full = RoundLog{};
+    for (0..RoundLog.CAP + 5) |_| full.add(1, 30.0);
+    try testing.expectEqual(RoundLog.CAP, full.n);
 }
 
 /// Past the compile sample, then MIN_SAMPLES folds.

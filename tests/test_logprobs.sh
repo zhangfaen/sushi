@@ -29,8 +29,11 @@ BASE="http://127.0.0.1:$PORT"
 [ -x "$BIN" ]   || { echo "fail: build sushi first"; exit 1; }
 
 ID="$(basename "$MODEL")"
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    exit 1
+fi
 LOG="$(mktemp)"
-pkill -f "sushi --serve.*port $PORT" 2>/dev/null; sleep 1
 "$BIN" --serve --model "$MODEL" --port "$PORT" >"$LOG" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null; rm -f "$LOG"' EXIT

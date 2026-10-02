@@ -11,6 +11,8 @@
 #     re-rendered) restores at the checkpoint, not cold, and its logprobs
 #     match the same prompt prefilled cold within 0.5 nats up to any flip.
 #  3. Both warm prefills are faster than the cold one.
+#  4. A new session sharing only another's system prompt restores at the message start that
+#     session's prefill marked, within the same 0.5-nat bar, and prefills faster than cold.
 #
 # Both cold arms start from a cache holding nothing they share: turn 1's whole prompt is a
 # prefix of turn 2's rendering, so an unrelated raw completion evicts turn 2's entry first.
@@ -19,7 +21,7 @@
 
 set -uo pipefail
 
-MODEL="${MIMO_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.5bpw}"
+MODEL="${MIMO_MODEL:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.3bpw}"
 PORT="${PORT:-19078}"
 BIN="${BINARY:-./zig-out/bin/sushi}"
 BASE="http://127.0.0.1:$PORT"
@@ -124,7 +126,55 @@ python3 -c "import sys; sys.exit(0 if $(field "$T1_WARM" .timings.prompt_ms) < 0
     || fail "warm turn 1 prefill not under 0.7x cold"
 python3 -c "import sys; sys.exit(0 if $(field "$T2_WARM" .timings.prompt_ms) < 0.7 * $(field "$T2_COLD" .timings.prompt_ms) else 1)" \
     || fail "warm turn 2 prefill not under 0.7x cold"
-grep '\[hot-cache\]' "$LOG" | head -20
+
+# 4. A new session that shares only another session's system prompt (an agent's subagent, a
+#    second chat) restores at the message start the first session's prefill marked, though that
+#    session's checkpoints and ring all lie past where the two diverge.
+SYSTEM="$(python3 - <<'PY'
+import random
+r = random.Random(7)
+w = "agent tool file cache ring window layer prompt reply token session restore commit budget chunk".split()
+print("You are a careful agent.\n" + "\n".join(f"Rule {i}: " + " ".join(r.choice(w) for _ in range(30)) for i in range(60)))
+PY
+)"
+task() { python3 -c "import random,sys; r=random.Random($1); w='trace the ring path and fix the bill then pin it with a test'.split(); print('Task: '+' '.join(r.choice(w) for _ in range(500)))"; }
+session() {
+    jq -nc --arg s "$SYSTEM" --arg q "$(task "$1")" \
+        '{messages:[{role:"system",content:$s},{role:"user",content:$q}],max_tokens:48,temperature:0,stream:false,logprobs:true,top_logprobs:1,chat_template_kwargs:{enable_thinking:false}}'
+}
+S_B_COLD=$(ask "$(session 2)") || { echo "fail: cold session B"; tail -20 "$LOG"; exit 1; }
+curl -sf --max-time 600 -X POST "$BASE/v1/completions" -H 'Content-Type: application/json' -d "$(unrelated)" >/dev/null \
+    || { echo "fail: unrelated completion"; tail -20 "$LOG"; exit 1; }
+S_A=$(ask "$(session 1)") || { echo "fail: session A"; tail -20 "$LOG"; exit 1; }
+HITS3=$(ring_hits)
+S_B_WARM=$(ask "$(session 2)") || { echo "fail: warm session B"; tail -20 "$LOG"; exit 1; }
+HITS4=$(ring_hits)
+echo "session A: cached_n=$(field "$S_A" .timings.cached_n) prompt_n=$(field "$S_A" .timings.prompt_n)"
+echo "session B cold: cached_n=$(field "$S_B_COLD" .timings.cached_n) prompt_ms=$(field "$S_B_COLD" .timings.prompt_ms)"
+echo "session B warm: cached_n=$(field "$S_B_WARM" .timings.cached_n) prompt_ms=$(field "$S_B_WARM" .timings.prompt_ms)"
+[ "$(field "$S_A" .timings.cached_n)" = 0 ] || fail "session A restored a prefix"
+[ "$HITS4" -gt "$HITS3" ] || fail "session B did not restore from a ring checkpoint"
+# The marks sit at message starts: the restore covers the whole system message.
+SYS_TOKENS=$(python3 -c "print(int($(field "$S_B_COLD" .timings.prompt_n) * 0.6))")
+[ "$(field "$S_B_WARM" .timings.cached_n)" -gt "$SYS_TOKENS" ] || fail "session B restored less than its shared system prompt"
+DRIFT=$(python3 - "$S_B_COLD" "$S_B_WARM" <<'PY2'
+import json, sys
+a, b = (json.loads(x)["choices"][0]["logprobs"]["content"] for x in sys.argv[1:3])
+n = 0
+worst = 0.0
+while n < min(len(a), len(b)) and a[n]["token"] == b[n]["token"]:
+    worst = max(worst, abs(a[n]["logprob"] - b[n]["logprob"]))
+    n += 1
+print(f"{n} {len(a)} {worst:.4f}")
+PY2
+)
+read -r AGREE TOTAL WORST <<< "$DRIFT"
+echo "session B cold vs warm: tokens agree for $AGREE of $TOTAL; max |dlogprob| over them $WORST nats"
+[ "$TOTAL" -gt 0 ] || fail "session B returned no logprobs to compare"
+python3 -c "import sys; sys.exit(0 if float('$WORST') <= 0.5 else 1)" || fail "session B's restored logprobs drift past 0.5 nats"
+python3 -c "import sys; sys.exit(0 if $(field "$S_B_WARM" .timings.prompt_ms) < 0.7 * $(field "$S_B_COLD" .timings.prompt_ms) else 1)" \
+    || fail "warm session B prefill not under 0.7x cold"
+grep '\[hot-cache\]' "$LOG" | head -30
 
 [ $EC = 0 ] && echo "PASS"
 exit $EC

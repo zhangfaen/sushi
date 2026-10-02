@@ -41,8 +41,10 @@ if [[ ! -x "$BINARY" ]]; then
     exit 1
 fi
 
-pkill -f 'sushi --serve' >/dev/null 2>&1 || true
-sleep 1
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or set PORT" >&2
+    exit 1
+fi
 
 echo "# 11-turn agent memory sweep — $(date '+%Y-%m-%d %H:%M')" > "$RESULTS"
 echo "" >> "$RESULTS"
@@ -80,6 +82,7 @@ run_one() {
     echo "  booting on port $PORT (log: $log)…"
     "$BINARY" --model "$path" --serve --port "$PORT" --log-level info > "$log" 2>&1 &
     local sp=$!
+    SERVER_PID=$sp
     if ! wait_for_health "$PORT" 240 "$sp"; then
         echo -e "${RED}[fail]${NC} server didn't come up"
         tail -20 "$log" | sed 's/^/    /'
@@ -144,12 +147,12 @@ run_one() {
     return 0
 }
 
-trap 'pkill -f "sushi --serve" 2>/dev/null || true' EXIT
+SERVER_PID=""
+trap '[[ -n "$SERVER_PID" ]] && kill "$SERVER_PID" 2>/dev/null; true' EXIT
 
 for entry in "${MODELS[@]}"; do
     IFS='|' read -r name display path type <<< "$entry"
     run_one "$name" "$display" "$path" "$type" || true
-    pkill -f "sushi --serve" 2>/dev/null || true
     sleep 3
 done
 

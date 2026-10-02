@@ -29,6 +29,15 @@ unmodified reference externally to generate independent numerical fixtures.
 The TP-aware FP8 QKV reconstruction in `src/mimo_source.zig` follows
 `conversion/mimo.py`, reimplemented in Zig.
 
+The MiMo-ViT vision tower in `src/mimo_vision.zig` is a port of the
+reference's `MiMoVisionTransformer` (`modeling_mimo_v2.py`), and its image
+preprocessing follows the vendor serving processors (`smart_resize`, bilinear
+resampling, ImageNet normalization). The three MTP heads in `src/mimo_mtp.zig`
+follow the MiMo-V2 MTP layer as XiaomiMiMo's vLLM and SGLang integrations
+compose it (Apache-2.0). Both are reimplemented in Zig against mlx-c;
+tests/dump_mimo_vision_fixtures.py and tests/dump_mimo_v2_mtp_fixtures.py
+render their fixtures from the unmodified reference modules.
+
 `src/fixtures/mimo_v26_chat_template.jinja` is the checkpoint's
 `chat_template` from tokenizer_config.json, unmodified, used as a test
 fixture; the model repository declares it under the MIT License.
@@ -116,6 +125,11 @@ Used in sushi (`src/transformer.zig`):
 
   * The GatedDeltaNet blocked-sequence prefill kernel, ported from
     `custom_kernels/qwen35_prefill/gdn.py` (`gated_delta_blocked_seq`).
+  * The software-pipelined GatedDeltaNet prefill kernel in
+    `src/kernels/gdn_pipelined.metal`, from `_pipelined_source(12)` in
+    `omlx/custom_kernels/qwen35_prefill/gdn.py` at 730bd6a (oMLX #4006),
+    via Samuel Reed (@STRML), mlx-serve #641. State and output accesses
+    are generic over StT and OutT to retain sushi's bf16 state contract.
   * The per-dispatch key-chunk budget in the head-dim-256 fused causal
     attention path, whose design comes from `qwen35_fa256_attention.py`.
   * The direct-index Qwen4 QSA prefill design (attend to each query's
@@ -245,6 +259,20 @@ Ported after the 2026-09-17 detach; each site names its upstream pull request:
     `elapsed_seconds` (0 on a cached row) and do not emit `entry_id`; a
     donated checkout is counted once, QSA banks by their capacity buffers, a
     slot's ring restore points count, and `/props` gains only `kv_cache_bytes`.
+  * `ignore_eos` (`requestEosSlice` in `src/server.zig`), from mlx-serve
+    eca42620 (#590) by David Dalcu. Modifications: `/v1/completions` only;
+    a chat request that sets it is refused by name.
+  * The SSD restore's rows credited at admission (`LookupResult.slot_owned`
+    in `src/prefix_cache.zig`, its read in `src/scheduler.zig`), from
+    mlx-serve #621 by Josh Bellis (@jdbellis). Modifications: the hybrid
+    restore only (MiMo's ring restore stays uncredited), proved by a live
+    peak-against-bill read before landing.
+  * Checked `config.json` reads (`cfgField`, `cfgInt`, `cfgF32`, `cfgObject`
+    and `cfgString` in `src/model.zig`, the root and size checks in
+    `src/model_discovery.zig`), from mlx-serve #608 by @alinselea.
+    Modifications: scoped to the common prelude, the qwen4_exp branch and
+    discovery; qwen4_exp adds a geometry refusal, and the fixtures are the
+    served packs' configs.
 
 --------------------------------------------------------------------------------
 h3.c-ane (Apple Neural Engine port of h3.c)
@@ -311,12 +339,16 @@ variant) so a fused kernel stays bit-identical to the op chain it replaces.
 Those are our own implementations written against MLX's observable behaviour,
 not copies of its source.
 
-`src/kernels/qsa_nax_header.metal` adapts the cooperative NAX fragment layout
-and MMA helpers from MLX's `steel/attn/nax.h` (Copyright (c) 2025 Apple
-Inc., MIT License, the same license as this project's LICENSE), and
-`src/kernels/qsa_nax.metal` adapts the split-head-dimension attention
-algorithm to per-query sparse block selection with a two-term bf16 PV.
-Contributed by Nikolai V.
+The original QSA NAX kernel adapted MLX's `steel/attn/nax.h` (Copyright
+(c) 2025 Apple Inc., MIT License). The dense-cache branches of `src/kernels/qsa_nax.metal`
+and `src/kernels/qsa_nax_header.metal` port oMLX's occupancy-tuned QSA
+kernel from `omlx/patches/mlx_vlm_qwen4_exp_compat/vendor/mlx_vlm/models/
+qwen4_exp/qsa_nax.py` at d6b2b92 (Apache-2.0).
+https://github.com/jundot/omlx/pull/4020
+Original mlx-serve QSA NAX implementation contributed by Nikolai V.
+The packed-cache branches retain the original MLX-derived split-head-dimension
+implementation and two-term bf16 PV. Dense-cache port via mlx-serve PR #636
+(bfe518f), contributed by Samuel Reed (@STRML).
 
 `src/kernels/attn_pd_nax_header.metal` adapts the same cooperative fragment
 layout and MMA wrapper from `steel/attn/nax.h`, and `src/kernels/attn_pd_nax.metal`

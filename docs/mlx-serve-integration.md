@@ -34,8 +34,31 @@ mlx-serve's build on its next bump; add new names instead, and say so in the CHA
 | `format.Decode`, `format.Codebook.mcg` | the decode spec passed to `moe` |
 | `kernels.DECODE_ROWS_MAX`, `kernels.usesPrefillArm`, `kernels.rowsOfShape` | the host's own row planning around `moe` |
 
+Added since mlx-serve's pin (44315136) and not called by it yet; each is additive, so the names above keep their
+meaning:
+
+| name | what it does | since |
+|---|---|---|
+| `GroupLayout` (`group_layout.Layout`) | validates a layer's rate-group (`<proj>.gN.*`) names, shapes and dtypes, bills their stored bytes, maps a router index to (group, local expert) | 4ca5ece4 |
+| `moeGroups` | the routed SwiGLU over a layer stored as rate groups: one `moe` pass per group, summed in f32 | 4ca5ece4 |
+| `moeWithShared` | `moe` plus an already gated shared expert; at one row the add folds into the decode reduction, rounded as the separate add | 698c4ae8 |
+
 The module's tests run as their own artifact (`exl3-test`) on `zig build test`; a change that
 passes them and keeps the names above is safe to hand over.
+
+## What the host owes the module
+
+- **`DECODE_ROWS_MAX` rows is the host's eager boundary.** A forward of more than `kernels.DECODE_ROWS_MAX` rows that
+  is not a verify forward takes the prefill GEMM (`kernels.usesPrefillArm`), which may read the routing back on the
+  host to build its window table (MiMo and Flash-Next geometries build it on the GPU; every other geometry on the
+  host). That read evaluates the stream, so an input the host fills after building the graph (a deferred leaf, such
+  as Flash-Next's n-gram embedding) is read empty: gather such inputs eagerly at those widths. Up to
+  `DECODE_ROWS_MAX` rows, and any `verify_rows` call, never read back.
+- **qwen4_exp packs are uniform-rate only on mlx-serve.** Its loader binds one `Bank` per layer
+  (`switch_mlp.{gate,up,down}_proj.{trellis,suh,svh}`) and checks each projection with `trellisAdmitted` against the
+  config's `num_experts`: every expert of a projection sits in one bank at one rate (gate, up and down may differ
+  from each other from 4ca5ece4 on). A rate-group or pruned pack ([pack-format](pack-format.md#rate-groups-per-expert-rates-uneven-expert-counts))
+  does not load there; serving one takes `GroupLayout` at load and `moeGroups` at dispatch, as this repo does.
 
 ## MLX pins
 
@@ -43,6 +66,14 @@ Each repo builds its own MLX and mlx-c; the module adds no pin of its own. Both 
 same commits: MLX d73eb752 (v0.32.2 plus the sorted `gather_qmm` NAX 32K-row fix,
 ml-explore/mlx#3922) and mlx-c 56b2d39. Move both pins together. MLX v0.32.3 needs a newer
 mlx-c: its `gather_qmm` gained a `global_scale` argument that mlx-c 56b2d39 does not pass.
+
+## Recommended pin
+
+At least d1408a57 (mlx-serve pins 44315136, 42 commits behind it; sushi v1.1.1 is 711572e9):
+- Before 4ca5ece4 (in v1.1.1), a pack whose gate and up trellises differ in rate passes `trellisAdmitted` and then
+  fails at dispatch with `BadExl3Shape`; from 4ca5ece4 `moe` serves it.
+- d1408a57 (after v1.1.1) adds the branch-free NAX prefill GEMM body: each expert GEMM runs in x0.73-0.75 of its time,
+  output bytes unchanged ([perf-baselines](perf-baselines.md#mimo-prefill-nax-body)).
 
 ## Handing a new engine to mlx-serve
 

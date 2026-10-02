@@ -86,9 +86,9 @@ pub fn canonicalRole(role: []const u8) []const u8 {
 }
 
 /// Fold every `system` message past index 0 into the leading one (created
-/// when absent). Templates we serve raise on a system turn that is not first
-/// and the raise is a silent generic fallback. Returns the joined buffer the
-/// caller owns, null when nothing moved.
+/// when absent). Qwen3.8's template raises on a system turn that is not first
+/// and the raise is a silent generic fallback; MiMo's renders it in place.
+/// Returns the joined buffer the caller owns, null when nothing moved.
 pub fn foldSystemMessages(allocator: std.mem.Allocator, messages: *std.ArrayList(Message)) !?[]const u8 {
     var extra: usize = 0;
     for (messages.items[@min(messages.items.len, 1)..]) |m| {
@@ -1691,6 +1691,23 @@ pub fn partialThinkCloseSuffixLen(buf: []const u8) usize {
     return 0;
 }
 
+test "thinkOpenerPossible: a thought no opener can start is delivered without waiting for more bytes" {
+    try std.testing.expect(!thinkOpenerPossible("The"));
+    try std.testing.expect(!thinkOpenerPossible("Okay"));
+    try std.testing.expect(!thinkOpenerPossible("\nWe"));
+    try std.testing.expect(thinkOpenerPossible(""));
+    try std.testing.expect(thinkOpenerPossible(" \n"));
+    try std.testing.expect(thinkOpenerPossible("<"));
+    try std.testing.expect(thinkOpenerPossible("<thi"));
+    try std.testing.expect(thinkOpenerPossible("\n<|chan"));
+    // Muse headers open with bare text: the context word and the recipient.
+    try std.testing.expect(thinkOpenerPossible("assist"));
+    try std.testing.expect(thinkOpenerPossible("assistant to"));
+    try std.testing.expect(thinkOpenerPossible("to"));
+    try std.testing.expect(thinkOpenerPossible("to=self"));
+    try std.testing.expect(!thinkOpenerPossible("too"));
+}
+
 test "partialThinkCloseSuffixLen holds back growing close tags, ignores prose" {
     try testing.expectEqual(@as(usize, 0), partialThinkCloseSuffixLen("plain reasoning text"));
     try testing.expectEqual(@as(usize, 7), partialThinkCloseSuffixLen("thinking…</think"));
@@ -2780,6 +2797,19 @@ pub fn normalizeEmbeddedThinkBlocks(allocator: std.mem.Allocator, text: []const 
 /// leaks tag fragments as visible content (a pi session showed prose ending
 /// in a glued "thought" because `<|channel>` flushed before "thought"
 /// arrived and completed the opener).
+/// Can a thought that begins with `buf` still grow into an opener the streaming gates strip?
+/// Every opener starts with `<` or is a Muse header (`assistant`, `to=`), so any other first
+/// byte is decided at once instead of waiting for the gates' 7 bytes.
+pub fn thinkOpenerPossible(buf: []const u8) bool {
+    const rest = std.mem.trimStart(u8, buf, " \n");
+    if (rest.len == 0 or rest[0] == '<') return true;
+    for ([_][]const u8{ "assistant", "to=" }) |word| {
+        const n = @min(rest.len, word.len);
+        if (std.mem.eql(u8, rest[0..n], word[0..n])) return true;
+    }
+    return false;
+}
+
 pub fn endsWithPartialThinkOpen(buf: []const u8) bool {
     const tags = [_][]const u8{ "<|channel>thought", "<think>" };
     for (tags) |tag| {
@@ -3250,6 +3280,21 @@ pub fn openThoughtFlush(buf: []const u8, shipped: bool) OpenThoughtFlush {
 /// The last delta of a thought whose remaining raw bytes are `body`.
 pub fn closedThoughtDelta(body: []const u8, shipped: bool) []const u8 {
     return if (shipped) std.mem.trimEnd(u8, body, "\n ") else std.mem.trim(u8, body, "\n ");
+}
+
+/// The last delta of a thought the generation cut while still open, from the
+/// bytes the stream still holds: an opener not yet consumed is structure, and a
+/// thought that shipped nothing drops its leading "\n " as the split does.
+pub fn cutThoughtDelta(held: []const u8, opener_consumed: bool, shipped: bool) []const u8 {
+    var body = held;
+    if (!opener_consumed) {
+        if (thinkOpenTagLenAt(body)) |l| {
+            body = body[l..];
+        } else if (std.mem.startsWith(u8, body, "<|channel>thought")) {
+            body = body["<|channel>thought".len..];
+        }
+    }
+    return if (shipped) body else std.mem.trimStart(u8, body, "\n ");
 }
 
 pub fn unstreamedReasoning(reasoning: []const u8, already: usize) ?[]const u8 {
@@ -3752,7 +3797,22 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
         for (calls.items) |*tc| tc.inferred = true;
     }
 
-    if (calls.items.len == 0) return null;
+    // A nameless placeholder cannot be executed or repaired by a client.
+    var named: usize = 0;
+    for (calls.items) |tc| {
+        if (std.mem.trim(u8, tc.name, " \t\r\n").len == 0) {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+            continue;
+        }
+        calls.items[named] = tc;
+        named += 1;
+    }
+    calls.items.len = named;
+    if (calls.items.len == 0) {
+        calls.deinit(allocator);
+        return null;
+    }
 
     // Final safety net: EVERY emitted call carries valid-JSON arguments, whatever
     // converter built them. The direct-construction converters (Gemma custom
@@ -6651,6 +6711,7 @@ fn parseHermesToolCall(allocator: std.mem.Allocator, block: []const u8) ?ParsedT
     const name_start = fn_start + fn_start_tag.len;
     const name_end = std.mem.indexOf(u8, block[name_start..], ">") orelse return null;
     const fn_name = std.mem.trim(u8, block[name_start .. name_start + name_end], " \n");
+    if (!isPlausibleParamName(fn_name)) return null;
 
     var args_map = std.ArrayList(u8).empty;
     defer args_map.deinit(allocator);
@@ -7240,11 +7301,28 @@ test "only a forced tool_choice carries a prompt instruction" {
     try testing.expectEqualStrings("\nYou MUST call the function \"get_time\". Do not respond with text.", one);
 }
 
-test "real mimo_v2 template preserves reasoning and XML tool history" {
+/// src/fixtures/mimo_v26_chat_template.jinja is the `chat_template` of
+/// XiaomiMiMo/MiMo-V2.6-Flash-RL's tokenizer_config.json, verbatim.
+fn mimoTemplateConfig(allocator: std.mem.Allocator) ChatConfig {
+    return .{
+        .chat_template = @embedFile("fixtures/mimo_v26_chat_template.jinja"),
+        .bos_token = null,
+        .eos_token = "<|im_end|>",
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+}
+
+test "real mimo_v2 template is the committed fixture" {
     const raw = std.c.getenv("MIMO_V2_SOURCE") orelse return error.SkipZigTest;
-    const a = testing.allocator;
-    var config = try loadChatConfig(testing.io, a, std.mem.span(raw));
+    var config = try loadChatConfig(testing.io, testing.allocator, std.mem.span(raw));
     defer config.deinit();
+    try testing.expectEqualStrings(@embedFile("fixtures/mimo_v26_chat_template.jinja"), config.chat_template);
+}
+
+test "mimo_v2 template preserves reasoning and XML tool history" {
+    const a = testing.allocator;
+    var config = mimoTemplateConfig(a);
     const calls = [_]ToolCall{.{ .id = "call_1", .name = "sum", .arguments = "{\"x\":2}" }};
     const messages = [_]Message{
         .{ .role = "user", .content = "Compute." },
@@ -7266,11 +7344,9 @@ test "real mimo_v2 template preserves reasoning and XML tool history" {
     try testing.expectEqualStrings(expected ++ "<think></think>", plain);
 }
 
-test "real mimo_v2 template renders a late system turn in place" {
-    const raw = std.c.getenv("MIMO_V2_SOURCE") orelse return error.SkipZigTest;
+test "mimo_v2 template renders a late system turn in place" {
     const a = testing.allocator;
-    var config = try loadChatConfig(testing.io, a, std.mem.span(raw));
-    defer config.deinit();
+    var config = mimoTemplateConfig(a);
     const messages = [_]Message{
         .{ .role = "system", .content = "S" },
         .{ .role = "user", .content = "hi" },
@@ -7281,6 +7357,37 @@ test "real mimo_v2 template renders a late system turn in place" {
     defer a.free(rendered);
     try testing.expectEqualStrings("<|im_start|>system\nS<|im_end|><|im_start|>user\nhi<|im_end|>" ++
         "<|im_start|>system\nlate<|im_end|><|im_start|>user\nagain<|im_end|><|im_start|>assistant\n", rendered);
+}
+
+test "mimo_v2 template renders a tools request as the reference does" {
+    // Expected bytes: transformers' apply_chat_template environment (jinja2, its
+    // json.dumps tojson) over the same template and request.
+    const a = testing.allocator;
+    var config = mimoTemplateConfig(a);
+    const tools_json =
+        \\[{"type":"function","function":{"name":"get_weather","description":"Current weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]
+    ;
+    const calls = [_]ToolCall{.{ .id = "call_1", .name = "get_weather", .arguments = "{\"city\":\"Paris\"}" }};
+    const messages = [_]Message{
+        .{ .role = "system", .content = "S" },
+        .{ .role = "user", .content = "Weather in Paris?" },
+        .{ .role = "assistant", .content = "", .reasoning_content = "Need weather.", .tool_calls = &calls },
+        .{ .role = "tool", .content = "18C", .tool_call_id = "call_1" },
+        .{ .role = "user", .content = "Thanks." },
+    };
+    const expected = "<|im_start|>system\nYou are provided with the following tools:\n\n<tools>\n" ++
+        "{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather\", " ++
+        "\"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}" ++
+        "\n</tools><|im_end|><|im_start|>system\nS<|im_end|><|im_start|>user\nWeather in Paris?<|im_end|>" ++
+        "<|im_start|>assistant\n<think>Need weather.</think><tool_call><function=get_weather><parameter=city>Paris</parameter>" ++
+        "</function></tool_call><|im_end|><|im_start|>tool\n18C<|im_end|><|im_start|>user\nThanks.<|im_end|>" ++
+        "<|im_start|>assistant\n";
+    const thinking = try renderChatTemplate(a, &messages, &config, tools_json, null, true, null, false);
+    defer a.free(thinking);
+    try testing.expectEqualStrings(expected, thinking);
+    const plain = try renderChatTemplate(a, &messages, &config, tools_json, null, false, null, false);
+    defer a.free(plain);
+    try testing.expectEqualStrings(expected ++ "<think></think>", plain);
 }
 
 test "collapseDoubledThinkTags collapses 2x → 1x" {
@@ -11353,6 +11460,20 @@ test "streamTailIsReasoning: an unopened block was content all along" {
     try testing.expect(streamTailIsReasoning(true, false, true));
     // Already closed and split ⇒ the tail is the visible answer.
     try testing.expect(!streamTailIsReasoning(false, true, true));
+}
+
+test "cutThoughtDelta: a thought cut at its opener delivers nothing, as the split does" {
+    // `max_tokens: 1` on a model that opens its own block: the stream holds only the seeded opener.
+    try testing.expectEqualStrings("", cutThoughtDelta("<think>", false, false));
+    try testing.expectEqualStrings("", cutThoughtDelta("<|channel>thought", false, false));
+    try testing.expectEqualStrings("", splitThinkBlock("<think>", true, false).reasoning_content orelse "");
+    // A prompt-opened thought cut before its first word, and one cut after it.
+    try testing.expectEqualStrings("", cutThoughtDelta("\n", false, false));
+    try testing.expectEqualStrings("Ok", cutThoughtDelta("\nOk", false, false));
+    // Once the opener is consumed, the same bytes are the thought's own text.
+    try testing.expectEqualStrings("<think>", cutThoughtDelta("<think>", true, false));
+    // After a delta shipped, the held run (withheld whitespace, a partial close) goes out as is.
+    try testing.expectEqualStrings(" \n</thi", cutThoughtDelta(" \n</thi", true, true));
 }
 
 test "promptTailOpensThink does not match Gemma's channel opener" {

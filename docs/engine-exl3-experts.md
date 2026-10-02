@@ -35,7 +35,7 @@ kernel on supported hardware.
   (plus `window`); per-tensor rate read from the trellis shape. Every other module stays the affine pack's.
 - **A rate is K = n/16**, n the packed halfwords per 256-weight tile (36 = K2.25, 48 = K3, 64 = K4): weight t's
   codeword is the 16-bit window ending at `((t+1)*n)>>4`, so its fresh bits follow from n and the pattern is never
-  stored. Even n in [32, 64] admits; `expert_quant.k` may be fractional JSON.
+  stored. Even n in [16, 128] admits (K1 to K8); `expert_quant.k` may be fractional JSON.
 - **Every reader keys on n, never on an integer K** (`exl3.Rate`, kernel template `NHW`, cache keys,
   `exl3ExpertBytes`); a K printed anywhere reads 2.25, not 36.
 - **Every fast path serves every admitted n; a guard test enumerates them** (`every admitted rate takes the fast
@@ -69,9 +69,17 @@ source FP8→bf16 loader (`usesMimoSourceTrunk`), billed dense by `mimoSourceRes
 
 ## Kernels
 
-- **Prefill**: run-aligned 32-row windows over a window table built on the GPU, K-generic cooperative readers, the
-  NAX 16x32x16 GEMM body with a K4 fast branch; ONE GEMM config reused across window counts (a per-row-count JIT
-  compiled per novel prompt length). The prefill scatter is fused into the finish reduce.
+- **Prefill**: run-aligned 32-row windows, K-generic cooperative readers, the NAX 16x32x16 GEMM body with a K4 fast
+  branch; ONE GEMM config reused across window counts (a per-row-count JIT compiled per novel prompt length).
+- **At the two served geometries (`mimoPrefillOn`: MiMo, Flash-Next) the routing never leaves the GPU**: one
+  threadgroup (a thread per expert, at most 512) builds the window table and the inverse sort order, and the finish
+  reduce reads the sorted down plane through that inverse, bytes equal to un-sorting it first. Any other geometry
+  builds the table on the host (a sync) and un-sorts with a copy ([perf-baselines](perf-baselines.md#exl3-gpu-routing-meta)).
+- **The NAX body's x loads carry no bounds branch**: a lane's row pointers are clamped into the input once per run
+  (a padded row reads a live neighbour whose product is never stored), the k loop is unswitched on the window's
+  second 16-row block and unrolled by two. Every row's products are the branch-guarded body's, so its bytes are
+  `GEMM_NAX_REFERENCE_SOURCE`'s at every admitted rate (the test's reference); -25% per GEMM at MiMo geometry
+  ([perf-baselines](perf-baselines.md#mimo-prefill-nax-body)).
 - **Prefill off NAX** (M1–M4, or NAX declined): the 8x8 `simdgroup_matrix` body computes D = W^T X^T so each lane's
   eight-weight slot group lands straight in its A fragments (the tile layout is the MMA fragment layout). f16 x and
   128-multiple widths only; anything else takes the scalar body. Not byte-identical to the scalar body (sum order).
@@ -81,11 +89,20 @@ source FP8→bf16 loader (`usesMimoSourceTrunk`), billed dense by `mimoSourceRes
   `simdgroup_matrix` arrays spilled them, 2.6x slower. Short runs pay the padding and still win
   ([perf-baselines](perf-baselines.md#m2max-64gb)).
 - **Decode**: four dispatches per MoE layer — pair prepare, split-K pair GEMV with f32 inner planes, fused mid+down
-  GEMV, f32 finish reduce (`moeSwigluFused`; top-k ≤ 32, named refusal above). On MiMo geometry the pair prepare is
-  fused into the pair GEMV and the SwiGLU mid is prepared once per (row, expert) (`preparedMidOn`, disabled for
-  Qwen; like `mimoPrefillOn` it keys on geometry, never on the rate). Rows ≤ `DECODE_ROWS_MAX` or verify rows take
-  this chain; wider takes `moePrefill`. The MTP head's MoE rows ride the decode chain and refuse wider
+  GEMV, f32 finish reduce (`moeSwigluFused`; top-k ≤ 32, named refusal above). On MiMo geometry the SwiGLU mid is
+  prepared once per (row, expert) (`preparedMidOn`, disabled for Qwen; like `mimoPrefillOn` it keys on geometry,
+  never on the rate), and at two or more rows the pair input too, in its own dispatch (`pairPrepare`): five
+  dispatches. A pair threadgroup would otherwise re-derive its K span of x (64 times per slot); one row keeps that
+  fused prepare, where the extra dispatch costs more than it saves. Rows ≤ `DECODE_ROWS_MAX` or verify rows take this
+  chain; wider takes `moePrefill`. The MTP head's MoE rows ride the decode chain and refuse wider
   (`Exl3MtpRowsExceedDecode`).
+- **The prepared pair input is stored in GEMV lane order** (`LANE_ORDER_SLOT`: each 16-row tile keeps rows 2q,
+  2q+1, 2q+8, 2q+9 at 4q..4q+3), so a lane reads its four as one half4 (`laneQuadReads`). Same values in the same
+  order: the pair planes keep the self-preparing kernel's bytes. The same layout for the prepared middle measured no
+  gain on the down (mid + down 52.1 vs 51.7 us at 1 row, 145.1 vs 145.9 at 4) and is not taken.
+- **Streamed serial decode** can add its already gated shared expert in the finish reduce, removing a dependent
+  elementwise dispatch. The routed sum is rounded to its output dtype before the shared addition, matching the
+  separate store and add bit for bit. Other widths, mixed gate/up rates and dtype mismatches retain the separate add.
 - **The decode GEMVs are bound by fixed per-tile work, not DRAM** (64-bit index math, two word loads and a 64-bit
   shift, four input reads, loop control). The lane-funnel arms (`gemvLayout`: every n below 64) carry two output
   tiles per threadgroup, load both k-tiles of an iteration before decoding, and bump pointers; the per-tile
@@ -103,8 +120,9 @@ source FP8→bf16 loader (`usesMimoSourceTrunk`), billed dense by `mimoSourceRes
   threadgroup LUT decode, a 24-bit multiply split, half2 input reads, bitfield extracts.
 - Dead for the prefill GEMM on the NAX body (MiMo and Flash-Next, outputs bit-identical, all slower): 64-row windows
   with one decode feeding 4 MMAs (+7-18%), a threadgroup-shared double-buffered decode (+30%), decoding tile k+1
-  before tile k's MMA (+27%), 256- or 64-thread groups (+12% at 2048 rows). The kernel is register/occupancy bound:
-  added live state loses.
+  before tile k's MMA (+27%), 256- or 64-thread groups (+12% at 2048 rows); on the branch-free body: a threadgroup
+  LUT decode of the w12 codebook (+32%), a per-k-step threadgroup barrier (+9%), unroll 4 (+20% over unroll 2),
+  64-row windows again (+9-13% on gate/up). The kernel is register/occupancy bound: added live state loses.
 - **The SwiGLU chain is f32**: gate, up, sigmoid, SiLU and their product stay in f32 registers through the multiply
   by the down suh. In f16, MiMo's activations put gate and up near 400 each and the product past 65504, so a whole
   routed row became inf. The next ceiling is the f16 down inner plane (about 2x above the measured peak).
@@ -112,7 +130,9 @@ source FP8→bf16 loader (`usesMimoSourceTrunk`), billed dense by `mimoSourceRes
   (the 48k prefill cliff). Owned-copy hidden captures at the chunk boundary; kernel configs dropped on their error
   paths.
 - **Levers**: `SUSHI_EXL3_GEMM_WIN`, `SUSHI_EXL3_WIN_ALIGN` (window geometry A/B); diagnostics
-  `SUSHI_EXL3_LAYER_UBENCH`, `SUSHI_EXL3_UNION_HIST`, `SUSHI_EXL3_SWIGLU_MAXABS`.
+  `SUSHI_EXL3_LAYER_UBENCH`, `SUSHI_EXL3_UNION_HIST`, `SUSHI_EXL3_SWIGLU_MAXABS`, `SUSHI_EXL3_GEMM_ARMS` (served vs
+  reference NAX body, interleaved, at MiMo geometry; `SUSHI_EXL3_GEMM_COUNTS` replays the per-layer `[exl3-counts]`
+  lines `SUSHI_EXL3_UNION_HIST` logs on a prefill).
 
 ## Parity bars
 

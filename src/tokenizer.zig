@@ -1,6 +1,9 @@
 const std = @import("std");
 const log = @import("log.zig");
 const io_util = @import("io_util.zig");
+const unicode_props = @import("tokenizer_unicode.zig");
+
+const WordRules = enum { legacy, letters, letters_marks };
 
 pub const TokenizerType = enum { sentencepiece_bpe, byte_level_bpe, wordpiece };
 
@@ -84,6 +87,8 @@ pub const Tokenizer = struct {
     /// (?i) contractions, {1,3} digit groups, `/` in the punct tail).
     /// Parsed from the tokenizer.json Split regex.
     pretok_style: PretokStyle = .gpt2,
+    /// Exact supported Split grammar, selected from tokenizer.json, never model name.
+    word_rules: WordRules = .legacy,
     /// Decode-only marker aliases (K2-Horizon): the `<ifm|…>` think and tool
     /// markers decode as the canonical `<think>` / GLM tag spellings every
     /// downstream parser reads. Encoding keeps the checkpoint's own bytes.
@@ -444,7 +449,7 @@ pub const Tokenizer = struct {
             words.deinit(allocator);
         }
         switch (self.pretok_style) {
-            .gpt2 => try gpt2PreTokenize(allocator, text, self.digit_group, &words),
+            .gpt2 => try gpt2PreTokenizeRules(allocator, text, self.digit_group, self.word_rules, &words),
             .llama3 => try llama3PreTokenize(allocator, text, &words),
         }
 
@@ -765,6 +770,10 @@ pub const Tokenizer = struct {
 /// off-distribution (the echo-precision slip class: `1o` for `10`, split
 /// digits, o-for-0 near-ties).
 fn gpt2PreTokenize(allocator: std.mem.Allocator, text: []const u8, digit_group: u8, words: *std.ArrayList([]const u8)) !void {
+    return gpt2PreTokenizeRules(allocator, text, digit_group, .legacy, words);
+}
+
+fn gpt2PreTokenizeRules(allocator: std.mem.Allocator, text: []const u8, digit_group: u8, rules: WordRules, words: *std.ArrayList([]const u8)) !void {
     var i: usize = 0;
     while (i < text.len) {
         const start = i;
@@ -793,7 +802,7 @@ fn gpt2PreTokenize(allocator: std.mem.Allocator, text: []const u8, digit_group: 
         // ── Pattern 2: `[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+` ──
         // Optional 1 char that's NOT \r, NOT \n, NOT letter, NOT digit (so it
         // CAN be whitespace or punct), followed by 1+ letters/marks.
-        if (matchOptionalNonLnnAndLetters(text, i)) |new_i| {
+        if (matchOptionalNonLnnAndLetters(text, i, rules)) |new_i| {
             i = new_i;
             try words.append(allocator, try allocator.dupe(u8, text[start..i]));
             continue;
@@ -801,12 +810,12 @@ fn gpt2PreTokenize(allocator: std.mem.Allocator, text: []const u8, digit_group: 
 
         // ── Pattern 3: `\p{N}` or `\p{N}{1,3}` — up to digit_group digits ──
         if (decodeCodepoint(text, i)) |cp_info| {
-            if (isDigit(cp_info.cp)) {
+            if (ruleNumber(cp_info.cp, rules)) {
                 i += cp_info.len;
                 var taken: u8 = 1;
                 while (taken < digit_group) : (taken += 1) {
                     const next = decodeCodepoint(text, i) orelse break;
-                    if (!isDigit(next.cp)) break;
+                    if (!ruleNumber(next.cp, rules)) break;
                     i += next.len;
                 }
                 try words.append(allocator, try allocator.dupe(u8, text[start..i]));
@@ -817,14 +826,14 @@ fn gpt2PreTokenize(allocator: std.mem.Allocator, text: []const u8, digit_group: 
         // ── Pattern 4: ` ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*` ──
         // Optional 1 space + 1+ chars that are NOT whitespace, NOT letter,
         // NOT mark, NOT digit (i.e. punctuation/symbols), then optional \r\n.
-        if (matchOptionalSpaceAndPunct(text, i)) |new_i| {
+        if (matchOptionalSpaceAndPunct(text, i, rules)) |new_i| {
             i = new_i;
             try words.append(allocator, try allocator.dupe(u8, text[start..i]));
             continue;
         }
 
         // ── Pattern 5: `\s*[\r\n]+` — whitespace ending in newline run ──
-        if (matchWhitespaceWithNewline(text, i)) |new_i| {
+        if (matchRuleNewline(text, i, rules)) |new_i| {
             i = new_i;
             try words.append(allocator, try allocator.dupe(u8, text[start..i]));
             continue;
@@ -833,17 +842,22 @@ fn gpt2PreTokenize(allocator: std.mem.Allocator, text: []const u8, digit_group: 
         // ── Pattern 6: `\s+(?!\S)` — whitespace not followed by non-ws ──
         // Greedy match with backtrack: shortens by 1 if the next char is \S
         // so the trailing space gets handed to pattern 2/4 on the next pass.
-        if (matchTrailingWhitespace(text, i)) |new_i| {
+        if (matchRuleTrailingWhitespace(text, i, rules)) |new_i| {
             i = new_i;
             try words.append(allocator, try allocator.dupe(u8, text[start..i]));
             continue;
         }
 
         // ── Pattern 7: `\s+` — fallback whitespace ──
-        if (i < text.len and isWhitespace(text[i])) {
-            while (i < text.len and isWhitespace(text[i])) i += 1;
-            try words.append(allocator, try allocator.dupe(u8, text[start..i]));
-            continue;
+        if (decodeCodepoint(text, i)) |first| {
+            if (ruleWhitespace(first.cp, rules)) {
+                while (decodeCodepoint(text, i)) |c| {
+                    if (!ruleWhitespace(c.cp, rules)) break;
+                    i += c.len;
+                }
+                try words.append(allocator, try allocator.dupe(u8, text[start..i]));
+                continue;
+            }
         }
 
         // Fallback: single byte (unreachable in well-formed UTF-8 input).
@@ -999,22 +1013,22 @@ fn llama3MatchPunct(text: []const u8, start: usize) ?usize {
 
 /// Pattern 2: `[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+`. Returns end position of
 /// match, or null if no letters at the right place.
-fn matchOptionalNonLnnAndLetters(text: []const u8, start: usize) ?usize {
+fn matchOptionalNonLnnAndLetters(text: []const u8, start: usize, rules: WordRules) ?usize {
     if (start >= text.len) return null;
     const cp_start = decodeCodepoint(text, start) orelse return null;
 
     // Try with the optional non-LNN char consumed.
-    if (!isLetter(cp_start.cp) and !isDigit(cp_start.cp) and
+    if (!ruleLetter(cp_start.cp, rules) and !ruleNumber(cp_start.cp, rules) and
         cp_start.cp != '\r' and cp_start.cp != '\n')
     {
         const after_opt = start + cp_start.len;
         if (after_opt < text.len) {
             const next_cp = decodeCodepoint(text, after_opt);
-            if (next_cp != null and isLetterOrMark(next_cp.?.cp)) {
+            if (next_cp != null and ruleWord(next_cp.?.cp, rules)) {
                 var i: usize = after_opt + next_cp.?.len;
                 while (i < text.len) {
                     const c = decodeCodepoint(text, i) orelse break;
-                    if (!isLetterOrMark(c.cp)) break;
+                    if (!ruleWord(c.cp, rules)) break;
                     i += c.len;
                 }
                 return i;
@@ -1023,11 +1037,11 @@ fn matchOptionalNonLnnAndLetters(text: []const u8, start: usize) ?usize {
     }
 
     // Try with 0-length optional: text[start] must itself be a letter/mark.
-    if (isLetterOrMark(cp_start.cp)) {
+    if (ruleWord(cp_start.cp, rules)) {
         var i: usize = start + cp_start.len;
         while (i < text.len) {
             const c = decodeCodepoint(text, i) orelse break;
-            if (!isLetterOrMark(c.cp)) break;
+            if (!ruleWord(c.cp, rules)) break;
             i += c.len;
         }
         return i;
@@ -1040,7 +1054,7 @@ fn matchOptionalNonLnnAndLetters(text: []const u8, start: usize) ?usize {
 /// 1+ punct/symbol codepoints, then optional \r\n run. Returns end position
 /// or null. The optional space MUST be exactly the byte ' ' (0x20), not
 /// any other whitespace — matches Qwen's tokenizer.json regex literal.
-fn matchOptionalSpaceAndPunct(text: []const u8, start: usize) ?usize {
+fn matchOptionalSpaceAndPunct(text: []const u8, start: usize, rules: WordRules) ?usize {
     if (start >= text.len) return null;
     var p_start: usize = start;
     if (text[start] == ' ') p_start = start + 1;
@@ -1048,13 +1062,13 @@ fn matchOptionalSpaceAndPunct(text: []const u8, start: usize) ?usize {
     if (p_start >= text.len) return null;
     const first_cp = decodeCodepoint(text, p_start) orelse return null;
     // Must be NOT whitespace, NOT letter, NOT mark, NOT digit.
-    if (isWhitespaceCp(first_cp.cp) or isLetter(first_cp.cp) or
-        isMark(first_cp.cp) or isDigit(first_cp.cp)) return null;
+    if (ruleWhitespace(first_cp.cp, rules) or ruleLetter(first_cp.cp, rules) or
+        ruleMarkInWord(first_cp.cp, rules) or ruleNumber(first_cp.cp, rules)) return null;
 
     var i: usize = p_start + first_cp.len;
     while (i < text.len) {
         const c = decodeCodepoint(text, i) orelse break;
-        if (isWhitespaceCp(c.cp) or isLetter(c.cp) or isMark(c.cp) or isDigit(c.cp)) break;
+        if (ruleWhitespace(c.cp, rules) or ruleLetter(c.cp, rules) or ruleMarkInWord(c.cp, rules) or ruleNumber(c.cp, rules)) break;
         i += c.len;
     }
     // Optional trailing \r\n.
@@ -1388,6 +1402,7 @@ fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []co
         .tok_type = tok_type,
         .digit_group = if (root.get("pre_tokenizer")) |pt| digitGroupFromPreTokenizer(pt) else 1,
         .pretok_style = if (root.get("pre_tokenizer")) |pt| pretokStyleFromPreTokenizer(pt) else .gpt2,
+        .word_rules = if (root.get("pre_tokenizer")) |pt| wordRulesFromPreTokenizer(pt) else .legacy,
         .byte_to_unicode = byte_to_unicode,
         .unicode_to_byte = unicode_to_byte,
         .bos_id = bos_id,
@@ -2103,7 +2118,8 @@ test "gpt2PreTokenize: full Python snippet matches HF reference" {
     // Note: `):\n` joins because pattern 4 allows trailing `[\r\n]*` after
     // the punct run. The byte-level encode + BPE merge stage downstream
     // turns this into exactly the same token-ids HF produces.
-    try expectPreTokens(testing.allocator,
+    try expectPreTokens(
+        testing.allocator,
         "def total(items):\n    total = 0",
         &.{ "def", " total", "(items", "):\n", "   ", " total", " =", " ", "0" },
     );
@@ -2402,7 +2418,7 @@ test "markerCloserFor: K2 think openers pair with their own closer" {
     var tok = Tokenizer.initEmptyForTests(allocator, .byte_level_bpe);
     defer tok.deinit();
     const specials = [_][]const u8{
-        "<ifm|think>",      "</ifm|think>",      "<ifm|think_fast>",   "</ifm|think_fast>",
+        "<ifm|think>",        "</ifm|think>",        "<ifm|think_fast>", "</ifm|think_fast>",
         "<ifm|think_faster>", "</ifm|think_faster>", "<ifm|tool_calls>", "</ifm|tool_calls>",
     };
     for (specials, 0..) |t, i| {
@@ -2416,4 +2432,174 @@ test "markerCloserFor: K2 think openers pair with their own closer" {
     try testing.expectEqual(@as(?u32, 5), tok.markerCloserFor(4));
     try testing.expectEqual(@as(?u32, null), tok.markerCloserFor(6));
     try testing.expectEqual(@as(?u32, null), tok.markerCloserFor(1));
+}
+
+/// Cross-model fixture runner also used by the format corpus. Tokenizers have
+/// deliberately different Split regexes; identical Unicode text must follow
+/// the selected model's grammar, not a language-wide heuristic.
+pub fn checkTokenizerRuleFixtures() !void {
+    const a = testing.allocator;
+    const fixture = try std.json.parseFromSlice(std.json.Value, a, @embedFile("fixtures/tokenizer-rules.json"), .{});
+    defer fixture.deinit();
+    for (fixture.value.array.items) |entry| {
+        const content = try std.json.Stringify.valueAlloc(a, entry.object.get("tokenizer").?, .{});
+        defer a.free(content);
+        var tok = try parseTokenizerContent(testing.io, a, content);
+        defer tok.deinit();
+        for (entry.object.get("cases").?.array.items) |tc| {
+            const input = tc.object.get("text").?.string;
+            const actual = try tok.encode(a, input);
+            defer a.free(actual);
+            const expected_json = tc.object.get("ids").?.array.items;
+            const expected = try a.alloc(u32, expected_json.len);
+            defer a.free(expected);
+            for (expected_json, 0..) |v, i| expected[i] = @intCast(v.integer);
+            testing.expectEqualSlices(u32, expected, actual) catch |err| {
+                std.debug.print("rule={s}, input={s}\n", .{ entry.object.get("rule").?.string, input });
+                return err;
+            };
+        }
+    }
+}
+
+test "tokenizer per-model Unicode rules preserve reference token IDs" {
+    try checkTokenizerRuleFixtures();
+}
+
+const splitPrefix = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?";
+const splitTail = "|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
+const lettersSplit = splitPrefix ++ "\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*" ++ splitTail;
+const marksSplit = splitPrefix ++ "[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*" ++ splitTail;
+
+fn wordRulesFromPreTokenizer(pt: std.json.Value) WordRules {
+    if (pt != .object) return .legacy;
+    const kind = pt.object.get("type") orelse return .legacy;
+    if (kind != .string) return .legacy;
+    if (std.mem.eql(u8, kind.string, "Split")) return wordRulesFromSplit(pt);
+    if (!std.mem.eql(u8, kind.string, "Sequence")) return .legacy;
+    const list = pt.object.get("pretokenizers") orelse return .legacy;
+    // Only claim a grammar we implement in full. Extra/reordered transforms
+    // retain the old path, rather than guessing from a language or substring.
+    if (list != .array or list.array.items.len != 2) return .legacy;
+    const byte_level = list.array.items[1];
+    if (byte_level != .object) return .legacy;
+    const ty = byte_level.object.get("type") orelse return .legacy;
+    if (ty != .string or !std.mem.eql(u8, ty.string, "ByteLevel")) return .legacy;
+    for ([_][]const u8{ "use_regex", "add_prefix_space" }) |key| {
+        const value = byte_level.object.get(key) orelse return .legacy;
+        if (value != .bool or value.bool) return .legacy;
+    }
+    return wordRulesFromSplit(list.array.items[0]);
+}
+
+fn wordRulesFromSplit(node: std.json.Value) WordRules {
+    if (node != .object) return .legacy;
+    const behavior = node.object.get("behavior") orelse return .legacy;
+    const invert = node.object.get("invert") orelse return .legacy;
+    if (behavior != .string or !std.mem.eql(u8, behavior.string, "Isolated") or invert != .bool or invert.bool) return .legacy;
+    const rx = splitRegexOf(node) orelse return .legacy;
+    if (std.mem.eql(u8, rx, lettersSplit)) return .letters;
+    if (std.mem.eql(u8, rx, marksSplit)) return .letters_marks;
+    return .legacy;
+}
+
+fn ruleLetter(cp: u21, rules: WordRules) bool {
+    return if (rules == .legacy) isLetter(cp) else unicode_props.category(cp) == .letter;
+}
+fn ruleNumber(cp: u21, rules: WordRules) bool {
+    return if (rules == .legacy) isDigit(cp) else unicode_props.category(cp) == .number;
+}
+fn ruleMarkInWord(cp: u21, rules: WordRules) bool {
+    return switch (rules) {
+        .legacy => isMark(cp),
+        .letters => false,
+        .letters_marks => unicode_props.category(cp) == .mark,
+    };
+}
+fn ruleWord(cp: u21, rules: WordRules) bool {
+    return ruleLetter(cp, rules) or ruleMarkInWord(cp, rules);
+}
+fn ruleWhitespace(cp: u21, rules: WordRules) bool {
+    return if (rules == .legacy) isWhitespaceCp(cp) else unicode_props.whitespace(cp);
+}
+fn matchRuleNewline(text: []const u8, start: usize, rules: WordRules) ?usize {
+    if (rules == .legacy) return matchWhitespaceWithNewline(text, start);
+    var i = start;
+    var last_newline: ?usize = null;
+    while (decodeCodepoint(text, i)) |c| {
+        if (!ruleWhitespace(c.cp, rules)) break;
+        i += c.len;
+        if (c.cp == '\r' or c.cp == '\n') last_newline = i;
+    }
+    return last_newline;
+}
+fn matchRuleTrailingWhitespace(text: []const u8, start: usize, rules: WordRules) ?usize {
+    if (rules == .legacy) return matchTrailingWhitespace(text, start);
+    var i = start;
+    var previous = start;
+    while (decodeCodepoint(text, i)) |c| {
+        if (!ruleWhitespace(c.cp, rules)) break;
+        previous = i;
+        i += c.len;
+    }
+    if (i == start) return null;
+    if (i == text.len) return i;
+    return if (previous > start) previous else null;
+}
+
+test "tokenizer per-model selection requires exact supported pipeline" {
+    const a = testing.allocator;
+    const fixture = try std.json.parseFromSlice(std.json.Value, a, @embedFile("fixtures/tokenizer-rules.json"), .{});
+    defer fixture.deinit();
+    for (fixture.value.array.items, 0..) |entry, i| {
+        const pt = entry.object.get("tokenizer").?.object.get("pre_tokenizer").?;
+        const expected: WordRules = if (i == 0) .letters else .letters_marks;
+        try testing.expectEqual(expected, wordRulesFromPreTokenizer(pt));
+        const list = pt.object.get("pretokenizers").?.array.items;
+        const split = &list[0].object;
+        try split.put(a, "invert", .{ .bool = true });
+        try testing.expectEqual(WordRules.legacy, wordRulesFromPreTokenizer(pt));
+        try split.put(a, "invert", .{ .bool = false });
+        try split.put(a, "behavior", .{ .string = "Removed" });
+        try testing.expectEqual(WordRules.legacy, wordRulesFromPreTokenizer(pt));
+        try split.put(a, "behavior", .{ .string = "Isolated" });
+        const byte_level = &list[1].object;
+        try byte_level.put(a, "use_regex", .{ .bool = true });
+        try testing.expectEqual(WordRules.legacy, wordRulesFromPreTokenizer(pt));
+        try byte_level.put(a, "use_regex", .{ .bool = false });
+        const pattern = &split.getPtr("pattern").?.object;
+        try pattern.put(a, "Regex", .{ .string = "\\p{L}+" });
+        try testing.expectEqual(WordRules.legacy, wordRulesFromPreTokenizer(pt));
+    }
+}
+
+test "real tokenizer reference parity (CPU only, gated)" {
+    const path_ptr = std.c.getenv("SUSHI_TOKENIZER_PARITY_FIXTURE") orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const file = try std.Io.Dir.openFileAbsolute(testing.io, std.mem.span(path_ptr), .{});
+    defer file.close(testing.io);
+    var buf: [4096]u8 = undefined;
+    var reader = file.reader(testing.io, &buf);
+    const data = try reader.interface.allocRemaining(a, .limited(16 * 1024 * 1024));
+    defer a.free(data);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, data, .{});
+    defer parsed.deinit();
+    for (parsed.value.array.items) |model| {
+        const dir = model.object.get("model_dir").?.string;
+        var tok = try loadTokenizer(testing.io, a, dir);
+        defer tok.deinit();
+        for (model.object.get("cases").?.array.items) |tc| {
+            const input = tc.object.get("text").?.string;
+            const actual = try tok.encode(a, input);
+            defer a.free(actual);
+            const values = tc.object.get("ids").?.array.items;
+            const expected = try a.alloc(u32, values.len);
+            defer a.free(expected);
+            for (values, 0..) |v, i| expected[i] = @intCast(v.integer);
+            testing.expectEqualSlices(u32, expected, actual) catch |err| {
+                std.debug.print("reference mismatch: model={s}, input={s}\n", .{ dir, input });
+                return err;
+            };
+        }
+    }
 }

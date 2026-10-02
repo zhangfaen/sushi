@@ -14,7 +14,7 @@ set -u
 PORT="${1:-11441}"
 BASE="http://127.0.0.1:$PORT"
 MODEL_A="${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw"
-MODEL_B="${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/MiMo-V2.6-Flash-Sushi-2.5bpw"
+MODEL_B="${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-2bpw"
 BIN="${SUSHI_BINARY:-./zig-out/bin/sushi}"
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'
 for m in "$MODEL_A" "$MODEL_B"; do
@@ -22,8 +22,11 @@ for m in "$MODEL_A" "$MODEL_B"; do
 done
 [ -x "$BIN" ] || { echo -e "${RED}FAIL${NC} $BIN missing"; exit 1; }
 
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    exit 1
+fi
 LOG=$(mktemp)
-pkill -f "sushi.*--port $PORT" 2>/dev/null; sleep 0.5
 "$BIN" --serve --model "$MODEL_A" --model-dir "$HOME/.sushi/models" --host 127.0.0.1 --port "$PORT" \
     --ctx-size 8192 --prefix-cache-mem 0 --prefix-cache-disk off --log-level info >"$LOG" 2>&1 &
 SRV=$!

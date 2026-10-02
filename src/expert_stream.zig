@@ -82,18 +82,18 @@ pub fn mxfp4ExpertBytes(hidden: u32, intermediate: u32) !u64 {
 pub fn expertBytesFor(allocator: std.mem.Allocator, model_dir: []const u8, geometry: Geometry, layout: quant.Layout) !u64 {
     switch (layout) {
         .bf16_fused => return expertBytes(2 * geometry.intermediate, geometry.hidden, geometry.intermediate),
-        .quantized_split, .mxfp4_split, .mxfp4_individual => {
+        .quantized_split, .mxfp4_split, .mxfp4_individual, .exl3_k4 => {
             var store = try quant.QuantStore.openForLayout(allocator, model_dir, .{
                 .layers = geometry.layers,
                 .experts = geometry.experts,
                 .hidden = geometry.hidden,
                 .intermediate = geometry.intermediate,
                 .first_moe_layer = geometry.first_moe_layer,
+                .exl3_n = geometry.exl3_n,
             }, layout);
             defer store.deinit();
             return store.expertBytes();
         },
-        .exl3_k4 => return exl3ExpertBytes(geometry),
     }
 }
 
@@ -295,12 +295,77 @@ pub const GroupResolution = struct {
     }
 };
 
+pub const MAX_PICK_TOLERANCE: f32 = 0.6;
+
+pub var pick_tolerance: f32 = 0;
+
+pub fn parsePickTolerance(raw: []const u8) error{InvalidPickTolerance}!f32 {
+    const value = std.fmt.parseFloat(f32, raw) catch return error.InvalidPickTolerance;
+    if (!(value >= 0) or value > MAX_PICK_TOLERANCE) return error.InvalidPickTolerance;
+    return value;
+}
+
+pub const PICK_STARVE_LIMIT: u8 = 3;
+
+pub fn substituteMisses(ids: []u16, logits: []const f32, cached: []const bool, tolerance: f32, k: usize, taken: []bool, loading: []bool, starved: []u8) u32 {
+    if (!(tolerance > 0) or k == 0 or k > 32) return 0;
+    const experts = cached.len;
+    const floor_gap: f32 = @log(1.0 - @min(tolerance, MAX_PICK_TOLERANCE));
+    @memset(loading[0..experts], false);
+    var swapped: u32 = 0;
+    var row: usize = 0;
+    while ((row + 1) * k <= ids.len) : (row += 1) {
+        const row_ids = ids[row * k ..][0..k];
+        const row_logits = logits[row * experts ..][0..experts];
+        var order: [32]u8 = undefined;
+        var misses: usize = 0;
+        for (row_ids, 0..) |expert, pos| {
+            if (cached[expert] or loading[expert]) continue;
+            var at = misses;
+            while (at > 0 and row_logits[row_ids[order[at - 1]]] < row_logits[expert]) : (at -= 1) order[at] = order[at - 1];
+            order[at] = @intCast(pos);
+            misses += 1;
+        }
+        if (misses == 0) continue;
+        @memset(taken[0..experts], false);
+        for (row_ids) |expert| taken[expert] = true;
+        for (order[0..misses]) |pos| {
+            const missed = row_ids[pos];
+            if (starved[missed] >= PICK_STARVE_LIMIT) {
+                starved[missed] = 0;
+                loading[missed] = true;
+                continue;
+            }
+            var best: ?usize = null;
+            var best_logit: f32 = -std.math.inf(f32);
+            for (0..experts) |candidate| {
+                if (taken[candidate] or !(cached[candidate] or loading[candidate])) continue;
+                const logit = row_logits[candidate];
+                if (!(logit - row_logits[missed] >= floor_gap) or !(logit > best_logit)) continue;
+                best = candidate;
+                best_logit = logit;
+            }
+            if (best) |pick| {
+                taken[pick] = true;
+                row_ids[pos] = @intCast(pick);
+                starved[missed] +|= 1;
+                swapped += 1;
+            } else {
+                starved[missed] = 0;
+                loading[missed] = true;
+            }
+        }
+    }
+    return swapped;
+}
+
 pub const GroupCache = struct {
     allocator: std.mem.Allocator,
     expert_to_slot: []i32,
     slot_to_expert: []u16,
     ages: []u64,
     ready: []bool,
+    swap_starved: []u8,
     tick: u64 = 0,
 
     fn empty(allocator: std.mem.Allocator) GroupCache {
@@ -310,6 +375,7 @@ pub const GroupCache = struct {
             .slot_to_expert = &.{},
             .ages = &.{},
             .ready = &.{},
+            .swap_starved = &.{},
         };
     }
 
@@ -322,11 +388,14 @@ pub const GroupCache = struct {
         const ages = try allocator.alloc(u64, capacity);
         errdefer allocator.free(ages);
         const ready = try allocator.alloc(bool, capacity);
+        errdefer allocator.free(ready);
+        const swap_starved = try allocator.alloc(u8, expert_count);
+        @memset(swap_starved, 0);
         @memset(expert_to_slot, -1);
         @memset(slot_to_expert, std.math.maxInt(u16));
         @memset(ages, 0);
         @memset(ready, false);
-        return .{ .allocator = allocator, .expert_to_slot = expert_to_slot, .slot_to_expert = slot_to_expert, .ages = ages, .ready = ready };
+        return .{ .allocator = allocator, .expert_to_slot = expert_to_slot, .slot_to_expert = slot_to_expert, .ages = ages, .ready = ready, .swap_starved = swap_starved };
     }
 
     pub fn deinit(self: *GroupCache) void {
@@ -334,7 +403,15 @@ pub const GroupCache = struct {
         self.allocator.free(self.slot_to_expert);
         self.allocator.free(self.ages);
         self.allocator.free(self.ready);
+        self.allocator.free(self.swap_starved);
         self.* = undefined;
+    }
+
+    pub fn cachedMask(self: *const GroupCache, out: []bool) void {
+        for (out, 0..) |*flag, expert| {
+            const raw_slot = if (expert < self.expert_to_slot.len) self.expert_to_slot[expert] else -1;
+            flag.* = raw_slot >= 0 and self.ready[@intCast(raw_slot)];
+        }
     }
 
     pub fn markReady(self: *GroupCache, slot: u16) void {
@@ -506,7 +583,7 @@ fn tensorLayout(allocator: std.mem.Allocator, fd: std.c.fd_t, key: []const u8, s
         error.SafetensorsTensorOutOfBounds => error.ExpertTensorOutOfBounds,
         else => error.InvalidExpertTensor,
     };
-    if (region.dtype != .bf16 or region.rank != 3 or !std.mem.eql(u64, &region.shape, &shape_expected)) return error.InvalidExpertTensor;
+    if (region.dtype != .bf16 or region.rank != 3 or !std.mem.eql(u64, region.shape[0..3], &shape_expected)) return error.InvalidExpertTensor;
     if (region.tensor_bytes != 2 * shape_expected[0] * shape_expected[1] * shape_expected[2]) return error.InvalidExpertTensor;
     return .{ .data_offset = region.data_offset, .tensor_offset = region.tensor_offset, .tensor_bytes = region.tensor_bytes, .experts = @intCast(shape_expected[0]) };
 }
@@ -517,6 +594,8 @@ pub const SlabSpec = struct {
     dtype: mlx.mlx_dtype,
     elem_bytes: u8,
     slot_bytes: u64,
+    exl3: bool = false,
+    packed_n: u32 = 0,
 };
 
 pub const ExpertStore = struct {
@@ -562,6 +641,8 @@ pub const ExpertStore = struct {
             const c: quant.Component = @fromBackingInt(@intCast(ci));
             const dtype: mlx.mlx_dtype = switch (q.dtypeOf(c)) {
                 .bf16 => .bfloat16,
+                .f16 => .float16,
+                .u16 => .uint16,
                 .u8 => .uint8,
                 .u32 => .uint32,
                 .other => .bfloat16,
@@ -569,14 +650,26 @@ pub const ExpertStore = struct {
             const elem: u8 = switch (q.dtypeOf(c)) {
                 .u8 => 1,
                 .u32 => 4,
-                .bf16 => 2,
+                .bf16, .f16, .u16 => 2,
                 .other => 0,
             };
-            return .{ .rows = q.rowsOf(c), .cols = q.colsOf(c), .dtype = dtype, .elem_bytes = elem, .slot_bytes = q.slotBytes(c) };
+            return .{ .rows = q.rowsOf(c), .cols = q.colsOf(c), .dtype = dtype, .elem_bytes = elem, .slot_bytes = q.slotBytes(c), .exl3 = q.layout == .exl3_k4, .packed_n = q.packed_n[ci] };
         }
         const rows: u32 = if (ci == 0) 2 * self.geometry.intermediate else self.geometry.hidden;
         const cols: u32 = if (ci == 0) self.geometry.hidden else self.geometry.intermediate;
         return .{ .rows = rows, .cols = cols, .dtype = .bfloat16, .elem_bytes = 2, .slot_bytes = @as(u64, rows) * cols * 2 };
+    }
+
+    pub fn slabSpecAt(self: *const ExpertStore, layer: u16, ci: usize) SlabSpec {
+        var spec = self.slabSpec(ci);
+        if (!spec.exl3) return spec;
+        spec.slot_bytes = self.spanAt(layer, 0, ci).len;
+        if (spec.packed_n != 0) {
+            const tiles = @as(u64, spec.rows) * (spec.cols / spec.packed_n);
+            spec.packed_n = @intCast(spec.slot_bytes / (tiles * spec.elem_bytes));
+            spec.cols = @intCast(spec.slot_bytes / (spec.rows * spec.elem_bytes));
+        }
+        return spec;
     }
 
     pub fn perExpertBytes(self: *const ExpertStore) u64 {
@@ -604,6 +697,7 @@ pub const ExpertStore = struct {
             .hidden = geometry.hidden,
             .intermediate = geometry.intermediate,
             .first_moe_layer = geometry.first_moe_layer,
+            .exl3_n = geometry.exl3_n,
         }, chosen);
         return .{ .allocator = allocator, .geometry = geometry, .files = &.{}, .spans = &.{}, .quantized = q };
     }
@@ -896,15 +990,25 @@ const SlabOperand = struct {
     }
 
     fn createTyped(allocator: std.mem.Allocator, count: u32, d0: u32, d1: u32, dtype: mlx.mlx_dtype, elem_bytes: u8) !SlabOperand {
-        if (count == 0 or d0 == 0 or d1 == 0 or elem_bytes == 0) return error.InvalidExpertGeometry;
-        const stride = @as(usize, d0) * @as(usize, d1) * @as(usize, elem_bytes);
+        return createShaped(allocator, count, &.{ @intCast(d0), @intCast(d1) }, dtype, elem_bytes);
+    }
+
+    fn createShaped(allocator: std.mem.Allocator, count: u32, inner: []const c_int, dtype: mlx.mlx_dtype, elem_bytes: u8) !SlabOperand {
+        if (count == 0 or inner.len == 0 or inner.len > 3 or elem_bytes == 0) return error.InvalidExpertGeometry;
+        var stride: usize = elem_bytes;
+        var shape: [4]c_int = undefined;
+        shape[0] = @intCast(count);
+        for (inner, 0..) |d, j| {
+            if (d <= 0) return error.InvalidExpertGeometry;
+            stride = try std.math.mul(usize, stride, @intCast(d));
+            shape[j + 1] = d;
+        }
         const slab = try io_mod.PageSlab.create(allocator, stride * count);
         errdefer slab.destroy();
         const payload = try allocator.create(io_mod.ImportPayload);
         errdefer allocator.destroy(payload);
         payload.* = .{};
-        const shape = [_]c_int{ @intCast(count), @intCast(d0), @intCast(d1) };
-        const operand = try io_mod.importSlab(slab, &shape, dtype, payload, .{});
+        const operand = try io_mod.importSlab(slab, shape[0 .. inner.len + 1], dtype, payload, .{});
         if (!operand.aliased) {
             _ = mlx.mlx_array_free(operand.array);
             return error.ExpertSlabImportCopied;
@@ -938,6 +1042,24 @@ const SlabOperand = struct {
         if (!self.present) return &.{};
         const slab = self.slab orelse return &.{};
         return slab.bytes[slot * self.stride ..][0..self.stride];
+    }
+
+    fn viewAs(self: *const SlabOperand, template: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+        var flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat);
+        try mlx.check(mlx.mlx_reshape(&flat, self.array, &.{-1}, 1, s));
+        var prefix = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(prefix);
+        const elements: c_int = @intCast(self.count * self.stride / mlx.mlx_array_itemsize(self.array));
+        try mlx.check(mlx.mlx_slice(&prefix, flat, &.{0}, 1, &.{elements}, 1, &.{1}, 1, s));
+        var shape: [4]c_int = undefined;
+        const dims = mlx.getShape(template);
+        @memcpy(shape[0..dims.len], dims);
+        shape[0] = @intCast(self.count);
+        var view = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(view);
+        try mlx.check(mlx.mlx_reshape(&view, prefix, &shape, dims.len, s));
+        return view;
     }
 
     fn borrow(self: *const SlabOperand) !mlx.mlx_array {
@@ -1019,18 +1141,94 @@ const LayerState = struct {
     active: bool = false,
     slabs: []SlabOperand = &.{},
     stats: LayerStats = .{},
+    spec_host: []i32 = &.{},
+    spec_slots: mlx.mlx_array = .{ .ctx = null },
+    spec_raw: mlx.mlx_array = .{ .ctx = null },
+
+    /// Brings the host map and its GPU copy up to the cache. The pair only ever
+    /// changes together: a failure leaves no GPU map and a host map that forces
+    /// the next call to rebuild.
+    fn refreshSpec(self: *LayerState, allocator: std.mem.Allocator) !void {
+        const experts = self.cache.expert_to_slot.len;
+        if (self.spec_host.len != experts) {
+            if (self.spec_host.len != 0) allocator.free(self.spec_host);
+            self.spec_host = &.{};
+            self.spec_host = try allocator.alloc(i32, experts);
+            @memset(self.spec_host, -2);
+        }
+        if (!refreshSpecMap(self.cache.expert_to_slot, self.cache.ready, self.spec_host) and self.spec_slots.ctx != null) return;
+        errdefer {
+            if (self.spec_slots.ctx != null) _ = mlx.mlx_array_free(self.spec_slots);
+            self.spec_slots = .{ .ctx = null };
+            if (self.spec_raw.ctx != null) _ = mlx.mlx_array_free(self.spec_raw);
+            self.spec_raw = .{ .ctx = null };
+            @memset(self.spec_host, -2);
+        }
+        const gpu = try allocator.alloc(i32, experts);
+        defer allocator.free(gpu);
+        for (gpu, self.spec_host) |*slot, host| slot.* = @max(host, 0);
+        if (@import("builtin").is_test and spec_alloc_fail_for_test) {
+            spec_alloc_fail_for_test = false;
+            return error.ExpertSpecMapAlloc;
+        }
+        const fresh = mlx.mlx_array_new_data(gpu.ptr, &[_]c_int{@intCast(experts)}, 1, .int32);
+        if (fresh.ctx == null) return error.ExpertSpecMapAlloc;
+        errdefer _ = mlx.mlx_array_free(fresh);
+        const raw = mlx.mlx_array_new_data(self.spec_host.ptr, &[_]c_int{@intCast(experts)}, 1, .int32);
+        if (raw.ctx == null) return error.ExpertSpecMapAlloc;
+        if (self.spec_slots.ctx != null) _ = mlx.mlx_array_free(self.spec_slots);
+        self.spec_slots = fresh;
+        if (self.spec_raw.ctx != null) _ = mlx.mlx_array_free(self.spec_raw);
+        self.spec_raw = raw;
+    }
 };
 
+var spec_alloc_fail_for_test = false;
+
+/// Writes the slot each expert reads from as the cache stands (-1 = not a ready
+/// hit) into `out`; returns whether any entry changed.
+pub fn refreshSpecMap(expert_to_slot: []const i32, ready: []const bool, out: []i32) bool {
+    var changed = false;
+    for (out, expert_to_slot) |*cached, raw| {
+        const now: i32 = if (raw >= 0 and ready[@intCast(raw)]) raw else -1;
+        if (cached.* != now) {
+            cached.* = now;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+/// A speculative expert result is exact only when the host resolution read
+/// every routed id from the slot the GPU gathered for it.
+pub fn specMatches(map: []const i32, ids: []const u16, remapped: []const u16, workspace: bool) bool {
+    if (workspace or ids.len != remapped.len) return false;
+    for (ids, remapped) |expert, slot| {
+        if (expert >= map.len) return false;
+        const predicted = map[expert];
+        if (predicted < 0 or predicted != slot) return false;
+    }
+    return true;
+}
+
 fn createSlabSet(allocator: std.mem.Allocator, store: *const ExpertStore, count: u32, s: mlx.mlx_stream) ![]SlabOperand {
+    return createSlabSetAt(allocator, store, null, count, s);
+}
+
+fn createSlabSetAt(allocator: std.mem.Allocator, store: *const ExpertStore, layer: ?u16, count: u32, s: mlx.mlx_stream) ![]SlabOperand {
     const n = store.componentCount();
     const slabs = try allocator.alloc(SlabOperand, n);
     errdefer allocator.free(slabs);
     var made: usize = 0;
     errdefer for (slabs[0..made]) |*operand| operand.destroy(allocator, s);
     while (made < n) : (made += 1) {
-        const spec = store.slabSpec(made);
+        const spec = if (layer) |li| store.slabSpecAt(li, made) else store.slabSpec(made);
         slabs[made] = if (!store.componentPresent(made) or spec.slot_bytes == 0)
             SlabOperand.absent()
+        else if (spec.exl3 and spec.packed_n != 0)
+            try SlabOperand.createShaped(allocator, count, &.{ @intCast(spec.rows), @intCast(spec.cols / spec.packed_n), @intCast(spec.packed_n) }, spec.dtype, spec.elem_bytes)
+        else if (spec.exl3)
+            try SlabOperand.createShaped(allocator, count, &.{@intCast(spec.cols)}, spec.dtype, spec.elem_bytes)
         else
             try SlabOperand.createTyped(allocator, count, spec.rows, spec.cols, spec.dtype, spec.elem_bytes);
     }
@@ -1055,6 +1253,7 @@ pub const Prepared = struct {
     raw_down: mlx.mlx_array = .{ .ctx = null },
     quant_raw: [quant.component_count]mlx.mlx_array = @splat(.{ .ctx = null }),
     quantized: bool = false,
+    owns_quant_views: bool = false,
     workspace: bool = false,
     held: [quant.component_count]?HeldLease = @splat(null),
     defer_to: ?*Engine = null,
@@ -1069,6 +1268,9 @@ pub const Prepared = struct {
         if (self.down.ctx != null) _ = mlx.mlx_array_free(self.down);
         if (self.raw_gate_up.ctx != null) _ = mlx.mlx_array_free(self.raw_gate_up);
         if (self.raw_down.ctx != null) _ = mlx.mlx_array_free(self.raw_down);
+        if (self.owns_quant_views) for (self.quant_raw) |arr| {
+            if (arr.ctx != null) _ = mlx.mlx_array_free(arr);
+        };
         for (self.held) |entry| {
             const held = entry orelse continue;
             if (self.defer_to) |engine| {
@@ -1168,6 +1370,8 @@ pub const Engine = struct {
         engine.layers = layers;
         var initialized: usize = 0;
         errdefer {
+            // The layers' slabs go before the layers: the outer `releaseSlabs` finds none left.
+            engine.releaseSlabs();
             for (layers[0..initialized]) |*layer| if (layer.active) layer.cache.deinit();
             engine.layers = &.{};
             allocator.free(layers);
@@ -1175,10 +1379,8 @@ pub const Engine = struct {
         for (layers, 0..) |*layer, layer_index| {
             initialized += 1;
             if (!engine.store.hasExpertLayer(@intCast(layer_index))) continue;
-            var cache = try GroupCache.init(allocator, plan.slots_per_layer, geometry.experts);
-            errdefer cache.deinit();
-            layer.* = .{ .cache = cache, .active = true };
-            layer.slabs = try createSlabSet(allocator, &engine.store, plan.slots_per_layer, s);
+            layer.* = .{ .cache = try GroupCache.init(allocator, plan.slots_per_layer, geometry.experts), .active = true };
+            layer.slabs = try createSlabSetAt(allocator, &engine.store, @intCast(layer_index), plan.slots_per_layer, s);
             engine.slab_imports += presentSlabCount(layer.slabs);
         }
         engine.union_slabs = try createSlabSet(allocator, &engine.store, geometry.experts, s);
@@ -1196,6 +1398,12 @@ pub const Engine = struct {
 
     fn releaseSlabs(self: *Engine) void {
         for (self.layers) |*layer| {
+            if (layer.spec_slots.ctx != null) _ = mlx.mlx_array_free(layer.spec_slots);
+            layer.spec_slots = .{ .ctx = null };
+            if (layer.spec_raw.ctx != null) _ = mlx.mlx_array_free(layer.spec_raw);
+            layer.spec_raw = .{ .ctx = null };
+            if (layer.spec_host.len != 0) self.allocator.free(layer.spec_host);
+            layer.spec_host = &.{};
             for (layer.slabs) |*operand| operand.destroy(self.allocator, self.s);
             if (layer.slabs.len != 0) self.allocator.free(layer.slabs);
             layer.slabs = &.{};
@@ -1256,6 +1464,13 @@ pub const Engine = struct {
 
     pub fn noteExpertCompute(self: *Engine, layer: u16, nanoseconds: u64) void {
         if (layer < self.layers.len) self.layers[layer].stats.compute_ns += nanoseconds;
+    }
+
+    pub fn pickState(self: *Engine, layer: u16, cached_out: []bool) ?[]u8 {
+        if (layer >= self.layers.len) return null;
+        const cache = &self.layers[layer].cache;
+        cache.cachedMask(cached_out);
+        return cache.swap_starved;
     }
 
     pub fn layerHits(self: *const Engine, layer: u16) u64 {
@@ -1355,6 +1570,32 @@ pub const Engine = struct {
         return .{ .gate = gate, .up = up, .down = down };
     }
 
+    pub const SpecRoute = struct {
+        /// int32 [experts]: the slot per expert, 0 where the host map says -1.
+        slots: mlx.mlx_array,
+        /// int32 [experts]: the host map itself, -1 where an expert is not ready.
+        raw: mlx.mlx_array,
+        /// Per-expert swap starvation counts (`substituteMisses` state).
+        starved: []const u8,
+        host: []const i32,
+        operands: [quant.component_count]mlx.mlx_array,
+    };
+
+    /// The layer's cache map and slab operands, so a decode forward can queue
+    /// the expert compute before the host reads the router ids. Null when the
+    /// store is not quantized.
+    pub fn specRoute(self: *Engine, layer_index: u16) !?SpecRoute {
+        if (self.store.quantized == null or layer_index >= self.layers.len) return null;
+        const layer = &self.layers[layer_index];
+        if (!layer.active or layer.slabs.len != self.store.componentCount()) return null;
+        const experts = layer.cache.expert_to_slot.len;
+        _ = experts;
+        try layer.refreshSpec(self.allocator);
+        var operands: [quant.component_count]mlx.mlx_array = @splat(.{ .ctx = null });
+        for (layer.slabs, 0..) |operand, ci| operands[ci] = operand.array;
+        return .{ .slots = layer.spec_slots, .raw = layer.spec_raw, .starved = layer.cache.swap_starved, .host = layer.spec_host, .operands = operands };
+    }
+
     pub fn prepareHost(self: *Engine, layer_index: u16, occurrences: []const u16) !Prepared {
         if (layer_index >= self.layers.len) return error.ExpertLayerOutOfRange;
         if (!self.layers[layer_index].active) return error.ExpertLayerAbsent;
@@ -1448,6 +1689,10 @@ pub const Engine = struct {
             }
         }
 
+        if (use_union) for (read_set, layer.slabs) |*operand, cached| {
+            operand.stride = cached.stride;
+        };
+
         var spans: std.ArrayList(io_mod.FillSpan) = .empty;
         defer spans.deinit(self.allocator);
         var misses: u64 = 0;
@@ -1530,7 +1775,15 @@ pub const Engine = struct {
         var raws: [quant.component_count]mlx.mlx_array = @splat(.{ .ctx = null });
         var views: FusedViews = .{ .gate = .{ .ctx = null }, .up = .{ .ctx = null }, .down = .{ .ctx = null } };
         if (quantized) {
-            for (0..n) |ci| raws[ci] = read_set[ci].array;
+            errdefer if (use_union) for (raws) |arr| {
+                if (arr.ctx != null) _ = mlx.mlx_array_free(arr);
+            };
+            for (0..n) |ci| {
+                raws[ci] = if (use_union and read_set[ci].present)
+                    try read_set[ci].viewAs(layer.slabs[ci].array, self.s)
+                else
+                    read_set[ci].array;
+            }
         } else {
             raws[0] = try read_set[0].borrow();
             errdefer _ = mlx.mlx_array_free(raws[0]);
@@ -1543,7 +1796,7 @@ pub const Engine = struct {
         layer.stats.union_members += resolution.union_ids.len;
         layer.stats.hits += resolution.hits;
         layer.stats.misses += resolution.misses;
-        layer.stats.fill_bytes += misses * self.plan.expert_bytes;
+        for (spans.items) |span_value| layer.stats.fill_bytes += span_value.len;
         committed = true;
         return .{
             .allocator = self.allocator,
@@ -1555,6 +1808,7 @@ pub const Engine = struct {
             .raw_down = if (quantized) .{ .ctx = null } else raws[1],
             .quant_raw = if (quantized) raws else @splat(.{ .ctx = null }),
             .quantized = quantized,
+            .owns_quant_views = quantized and use_union,
             .workspace = resolution.workspace,
             .held = held,
             .defer_to = self,
@@ -1657,7 +1911,7 @@ test "exl3 expert bytes bill the pack's own halfwords per tile" {
     const t = std.testing;
     const h: u64 = 2560;
     const i: u64 = 640;
-    for ([_]u32{ 64, 48, 40, 32 }) |n| {
+    for ([_]u32{ 16, 24, 32, 36, 40, 48, 64, 80, 104, 128 }) |n| {
         const b = try exl3ExpertBytes(.{ .layers = 48, .experts = 512, .hidden = h, .intermediate = i, .exl3_n = n });
         const tile: u64 = n;
         const gate_up = (h / 16) * (i / 16) * tile * 2 + h * 2 + i * 2;
@@ -1898,7 +2152,7 @@ test "real qwen expert store spans and source bytes are exact" {
     try t.expectEqualSlices(u8, direct, combined);
 }
 
-fn writeTinyExpertCheckpoint(allocator: std.mem.Allocator, dir: std.Io.Dir, experts: u16, hidden: u32, inter: u32) ![]u8 {
+pub fn writeTinyExpertCheckpoint(allocator: std.mem.Allocator, dir: std.Io.Dir, experts: u16, hidden: u32, inter: u32) ![]u8 {
     const io = std.testing.io;
     const gate_key = "model.language_model.layers.0.mlp.experts.gate_up_proj";
     const down_key = "model.language_model.layers.0.mlp.experts.down_proj";
@@ -2917,4 +3171,348 @@ test "expert stream: under streaming an MTP on by flag refuses, a settings mtp i
     try t.expectEqual(MtpUnderStreaming.off, mtpUnderStreaming(false, false, false));
     // The engine default never refuses a streamed load: it resolves off.
     try t.expectEqual(MtpUnderStreaming.drop_default, mtpUnderStreaming(true, false, true));
+}
+
+test "exl3 Sushi CPU expert bytes at K1 and K8 include all three scale pairs" {
+    for ([_]u32{ 16, 128 }) |n| {
+        const got = try exl3ExpertBytes(.{ .layers = 48, .experts = 256, .hidden = 4096, .intermediate = 2048, .exl3_n = n });
+        const packed_bytes: u64 = if (n == 16) 3 * 1048576 else 3 * 8388608;
+        try std.testing.expectEqual(packed_bytes + 3 * (4096 + 2048) * 2, got);
+    }
+}
+
+test "a uniform EXL3 layout reaches its shards: only grouped or pruned packs refuse streaming" {
+    const t = std.testing;
+    const opened = ExpertStore.openLayout(t.allocator, "/missing-sushi-coder-pack", .{ .layers = 2, .experts = 4, .hidden = 128, .intermediate = 128 }, .exl3_k4);
+    if (opened) |store| {
+        var s = store;
+        s.deinit();
+        return error.TestUnexpectedResult;
+    } else |err| try t.expect(err != error.Exl3RaggedStreamingUnsupported and err != error.Exl3RateGroupsStreamingUnsupported);
+}
+
+fn writeMimoExl3StreamFixture(dir: std.Io.Dir) !void {
+    const a = std.testing.allocator;
+    var header: std.ArrayList(u8) = .empty;
+    defer header.deinit(a);
+    var index: std.ArrayList(u8) = .empty;
+    defer index.deinit(a);
+    try header.append(a, '{');
+    try index.appendSlice(a, "{\"weight_map\":{");
+    var offset: usize = 0;
+    for (1..3) |layer| {
+        for (0..9) |ci| {
+            const c: quant.Component = @fromBackingInt(@intCast(ci));
+            const weight = ci % 3 == 0;
+            const n: usize = if (layer == 1) 36 else 64;
+            const bytes: usize = 4 * (if (weight) 8 * 8 * n * 2 else 128 * 2);
+            const key = try std.fmt.allocPrint(a, "model.layers.{d}.mlp.switch_mlp.{s}_proj.{s}", .{ layer, @tagName(quant.projectionOf(c)), if (weight) "trellis" else if (ci % 3 == 1) "suh" else "svh" });
+            defer a.free(key);
+            const shape = if (weight) try std.fmt.allocPrint(a, "4,8,8,{d}", .{n}) else try a.dupe(u8, "4,128");
+            defer a.free(shape);
+            const sep = if (offset == 0) "" else ",";
+            const item = try std.fmt.allocPrint(a, "{s}\"{s}\":{{\"dtype\":\"{s}\",\"shape\":[{s}],\"data_offsets\":[{d},{d}]}}", .{ sep, key, if (weight) "U16" else "F16", shape, offset, offset + bytes });
+            defer a.free(item);
+            try header.appendSlice(a, item);
+            const entry = try std.fmt.allocPrint(a, "{s}\"{s}\":\"experts.safetensors\"", .{ sep, key });
+            defer a.free(entry);
+            try index.appendSlice(a, entry);
+            offset += bytes;
+        }
+    }
+    try header.append(a, '}');
+    try index.appendSlice(a, "}}");
+    const file = try a.alloc(u8, 8 + header.items.len + offset);
+    defer a.free(file);
+    std.mem.writeInt(u64, file[0..8], header.items.len, .little);
+    @memcpy(file[8..][0..header.items.len], header.items);
+    for (file[8 + header.items.len ..], 0..) |*byte, i| byte.* = @truncate(i *% 13 +% i / 251);
+    try dir.writeFile(std.testing.io, .{ .sub_path = "experts.safetensors", .data = file });
+    try dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors.index.json", .data = index.items });
+}
+
+fn checkMimoExl3Streaming(runtime: bool) !void {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeMimoExl3StreamFixture(tmp.dir);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(t.io, &buf);
+    const path = buf[0..len];
+    const geometry: Geometry = .{ .layers = 3, .experts = 4, .hidden = 128, .intermediate = 128, .first_moe_layer = 1, .exl3_n = 64 };
+    try t.expectEqual(quant.Layout.exl3_k4, try quant.streamingLayoutOfDir(t.allocator, t.io, "mimo_v2", path, 3, 1));
+    const per = try expertBytesFor(t.allocator, path, geometry, .exl3_k4);
+    try t.expectEqual(try exl3ExpertBytes(geometry), per);
+    const fixed = (1 << 20) + 4 * per + 2 * per + BOUNCE_BYTES;
+    const ledger = try budgetLedger(fixed + 4 * per, 1 << 20, 0, moeLayerCount(geometry), 4, 2, per, BOUNCE_BYTES);
+    try t.expectEqual(@as(u16, 2), ledger.slots_per_layer);
+    try t.expectEqual(fixed + ledger.cache_bytes, ledger.budget_bytes);
+    var store = try ExpertStore.openLayout(t.allocator, path, geometry, .exl3_k4);
+    defer store.deinit();
+    try t.expect(!store.hasExpertLayer(0));
+    const source_file = try tmp.dir.readFileAlloc(t.io, "experts.safetensors", t.allocator, .limited(1 << 20));
+    defer t.allocator.free(source_file);
+    for (1..3) |layer| {
+        var cache = try GroupCache.init(t.allocator, 2, 4);
+        defer cache.deinit();
+        const routes = [_]u16{ 3, 0, 3, 2, 1 };
+        var resolved = try cache.resolve(t.allocator, &routes);
+        defer resolved.deinit(t.allocator);
+        for (routes, resolved.remapped) |expert, slot| try t.expectEqual(expert, resolved.union_ids[slot]);
+        for (0..9) |ci| {
+            const spec = store.slabSpecAt(@intCast(layer), ci);
+            if (ci % 3 == 0) try t.expectEqual(@as(u32, if (layer == 1) 36 else 64), spec.packed_n);
+            for (0..4) |expert| {
+                const span_value = store.spanAt(@intCast(layer), @intCast(expert), ci);
+                try t.expectEqual(spec.slot_bytes, span_value.len);
+                const bytes = try t.allocator.alloc(u8, @intCast(span_value.len));
+                defer t.allocator.free(bytes);
+                try readExact(store.fdAt(span_value.file), bytes, span_value.offset);
+                try t.expectEqualSlices(u8, source_file[@intCast(span_value.offset)..][0..bytes.len], bytes);
+            }
+        }
+    }
+    if (!runtime) return;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var engine = try Engine.initWithOptions(t.allocator, path, geometry, ledger.cache_bytes, s, .{ .layout = .exl3_k4, .bounce_size = 1 << 20 });
+    defer engine.deinit();
+    try t.expect(!engine.layers[0].active);
+    try t.expectEqual(@as(usize, 0), engine.layers[0].slabs.len);
+    try t.expectEqual(@as(u64, 0), engine.fallback_imports);
+    try t.expectError(error.ExpertLayerAbsent, engine.prepareHost(0, &.{0}));
+    try engine.warmCache();
+    for ([_]u16{ 1, 2 }) |layer| {
+        const before = engine.fill_bytes_total;
+        var warm = try engine.prepareHost(layer, &.{0});
+        warm.deinit();
+        try t.expectEqual(before, engine.fill_bytes_total);
+    }
+    for ([_]u16{ 1, 2, 1 }) |layer| {
+        for ([_][]const u16{ &.{ 3, 0, 3 }, &.{ 0, 2, 3, 1, 2 } }) |routes| {
+            var prepared = try engine.prepareHost(layer, routes);
+            defer prepared.deinit();
+            try t.expectEqual(routes.len > 3, prepared.workspace);
+            for (0..9) |ci| {
+                const arr = prepared.quantOperand(@fromBackingInt(@intCast(ci)));
+                const shape = mlx.getShape(arr);
+                if (ci % 3 == 0) try t.expectEqual(@as(c_int, if (layer == 1) 36 else 64), shape[3]);
+                try mlx.check(mlx.mlx_array_eval(arr));
+                const data: [*]const u8 = if (ci % 3 == 0) @ptrCast(mlx.mlx_array_data_uint16(arr).?) else @ptrCast(mlx.mlx_array_data_float16(arr).?);
+                for (routes, prepared.remapped) |expert, slot| {
+                    const source = engine.store.spanAt(layer, expert, ci);
+                    const bytes = try t.allocator.alloc(u8, @intCast(source.len));
+                    defer t.allocator.free(bytes);
+                    try readExact(engine.store.fdAt(source.file), bytes, source.offset);
+                    const actual = if (prepared.workspace) engine.unionSlotBytesAt(slot, ci) else engine.cacheSlotBytesAt(layer, slot, ci);
+                    try t.expectEqualSlices(u8, bytes, actual);
+                    try t.expectEqualSlices(u8, bytes, data[@as(usize, slot) * bytes.len ..][0..bytes.len]);
+                }
+            }
+        }
+    }
+    var allocated: u64 = 0;
+    for (engine.layers) |layer| for (layer.slabs) |slab| {
+        allocated += slab.slab.?.bytes.len;
+    };
+    for (engine.union_slabs) |slab| allocated += slab.slab.?.bytes.len;
+    try t.expect(allocated <= ledger.cache_bytes + ledger.workspace_bytes + ledger.selected_bytes + ledger.bounce_bytes - 4 * (1 << 20));
+}
+
+test "MiMo EXL3 streaming CPU geometry ledger and slab ids cross the dense prefix" {
+    try checkMimoExl3Streaming(false);
+}
+
+test "MiMo EXL3 streaming imported slabs warm and reuse different layer rates" {
+    try checkMimoExl3Streaming(true);
+}
+
+test "expert pick tolerance accepts 0 through 0.6 and names a bad value" {
+    const t = std.testing;
+    try t.expectEqual(@as(f32, 0.0), try parsePickTolerance("0"));
+    try t.expectEqual(@as(f32, 0.3), try parsePickTolerance("0.3"));
+    try t.expectEqual(@as(f32, 0.6), try parsePickTolerance("0.6"));
+    try t.expectError(error.InvalidPickTolerance, parsePickTolerance("0.61"));
+    try t.expectError(error.InvalidPickTolerance, parsePickTolerance("1"));
+    try t.expectError(error.InvalidPickTolerance, parsePickTolerance("1.5"));
+    try t.expectError(error.InvalidPickTolerance, parsePickTolerance("-0.1"));
+    try t.expectError(error.InvalidPickTolerance, parsePickTolerance("nan"));
+    try t.expectError(error.InvalidPickTolerance, parsePickTolerance("nope"));
+    try t.expectError(error.InvalidPickTolerance, parsePickTolerance(""));
+}
+
+fn PickScratch(comptime experts: usize) type {
+    return struct {
+        taken: [experts]bool = undefined,
+        loading: [experts]bool = undefined,
+        starved: [experts]u8 = @splat(0),
+
+        fn run(self: *@This(), ids: []u16, logits: []const f32, cached: []const bool, tolerance: f32, k: usize) u32 {
+            return substituteMisses(ids, logits, cached, tolerance, k, &self.taken, &self.loading, &self.starved);
+        }
+    };
+}
+
+test "expert substitution with zero tolerance changes nothing" {
+    const t = std.testing;
+    var sc = PickScratch(6){};
+    const logits = [_]f32{ 3.0, 2.9, 2.8, 2.0, 1.9, -30.0 };
+    var ids = [_]u16{ 0, 1, 2 };
+    const cached = [_]bool{ true, true, false, true, true, true };
+    try t.expectEqual(@as(u32, 0), sc.run(&ids, &logits, &cached, 0.0, 3));
+    try t.expectEqualSlices(u16, &.{ 0, 1, 2 }, &ids);
+}
+
+test "expert substitution swaps a missed expert for the best cached one within tolerance" {
+    const t = std.testing;
+    var sc = PickScratch(6){};
+    const logits = [_]f32{ 3.0, 2.9, 2.8, 2.7, 2.0, -30.0 };
+    var ids = [_]u16{ 0, 1, 2 };
+    const cached = [_]bool{ true, true, false, true, true, true };
+    try t.expectEqual(@as(u32, 1), sc.run(&ids, &logits, &cached, 0.3, 3));
+    try t.expectEqualSlices(u16, &.{ 0, 1, 3 }, &ids);
+}
+
+test "expert substitution keeps a miss whose cached alternatives fall below the tolerance" {
+    const t = std.testing;
+    var sc = PickScratch(6){};
+    const logits = [_]f32{ 3.0, 2.9, 2.8, 0.5, 0.4, -30.0 };
+    var ids = [_]u16{ 0, 1, 2 };
+    const cached = [_]bool{ true, true, false, true, true, true };
+    try t.expectEqual(@as(u32, 0), sc.run(&ids, &logits, &cached, 0.3, 3));
+    try t.expectEqualSlices(u16, &.{ 0, 1, 2 }, &ids);
+}
+
+test "expert substitution never picks an uncached or already selected expert" {
+    const t = std.testing;
+    var sc = PickScratch(6){};
+    const logits = [_]f32{ 3.0, 2.9, 2.8, 2.79, 2.78, -30.0 };
+    var ids = [_]u16{ 0, 1, 2 };
+    const cached = [_]bool{ true, true, false, false, true, true };
+    try t.expectEqual(@as(u32, 1), sc.run(&ids, &logits, &cached, 0.5, 3));
+    try t.expectEqualSlices(u16, &.{ 0, 1, 4 }, &ids);
+}
+
+test "expert substitution scores each row alone and gives two misses different replacements" {
+    const t = std.testing;
+    var sc = PickScratch(6){};
+    const logits = [_]f32{
+        3.0, 2.9, 2.8, 2.7, 2.6, -30.0,
+        2.6, 2.7, 2.8, 2.9, 3.0, -30.0,
+    };
+    var ids = [_]u16{ 0, 1, 2, 4, 3, 2 };
+    const cached = [_]bool{ true, false, false, true, true, true };
+    try t.expectEqual(@as(u32, 3), sc.run(&ids, &logits, &cached, 0.5, 3));
+    try t.expectEqualSlices(u16, &.{ 0, 3, 4, 4, 3, 0 }, &ids);
+}
+
+test "expert substitution lets the more probable miss take the better substitute" {
+    const t = std.testing;
+    var sc = PickScratch(6){};
+    const logits = [_]f32{ 3.0, 2.5, 2.9, 2.8, 2.7, -30.0 };
+    var ids = [_]u16{ 0, 1, 2 };
+    const cached = [_]bool{ true, false, false, true, true, true };
+    try t.expectEqual(@as(u32, 2), sc.run(&ids, &logits, &cached, 0.5, 3));
+    try t.expectEqualSlices(u16, &.{ 0, 4, 3 }, &ids);
+}
+
+test "expert substitution survives non-finite logits and a trailing partial row" {
+    const t = std.testing;
+    var sc = PickScratch(6){};
+    const nan = std.math.nan(f32);
+    const inf = std.math.inf(f32);
+    const logits = [_]f32{ nan, nan, nan, nan, nan, nan, -inf, -inf, -inf, -inf, -inf, -inf };
+    var ids = [_]u16{ 0, 1, 2, 3, 4 };
+    const cached = [_]bool{ true, false, false, true, true, true };
+    try t.expectEqual(@as(u32, 0), sc.run(&ids, &logits, &cached, 0.5, 3));
+    try t.expectEqualSlices(u16, &.{ 0, 1, 2, 3, 4 }, &ids);
+}
+
+test "expert substitution reuses an expert another row is fetching anyway" {
+    const t = std.testing;
+    var sc = PickScratch(6){};
+    const logits = [_]f32{
+        3.0, 2.9, 2.0, -30.0, -30.0, -30.0,
+        3.0, 2.9, 2.8, 2.9, -30.0, -30.0,
+    };
+    var ids = [_]u16{ 0, 1, 2, 0, 1, 3 };
+    const cached = [_]bool{ true, true, false, false, true, true };
+    try t.expectEqual(@as(u32, 1), sc.run(&ids, &logits, &cached, 0.3, 3));
+    try t.expectEqualSlices(u16, &.{ 0, 1, 2, 0, 1, 2 }, &ids);
+}
+
+test "expert substitution stops swapping an expert out after the starvation limit" {
+    const t = std.testing;
+    var sc = PickScratch(6){};
+    const logits = [_]f32{ 3.0, 2.9, 2.8, 2.7, 2.0, -30.0 };
+    const cached = [_]bool{ true, true, false, true, true, true };
+    for (0..PICK_STARVE_LIMIT) |_| {
+        var ids = [_]u16{ 0, 1, 2 };
+        try t.expectEqual(@as(u32, 1), sc.run(&ids, &logits, &cached, 0.3, 3));
+        try t.expectEqualSlices(u16, &.{ 0, 1, 3 }, &ids);
+    }
+    var kept = [_]u16{ 0, 1, 2 };
+    try t.expectEqual(@as(u32, 0), sc.run(&kept, &logits, &cached, 0.3, 3));
+    try t.expectEqualSlices(u16, &.{ 0, 1, 2 }, &kept);
+    var again = [_]u16{ 0, 1, 2 };
+    try t.expectEqual(@as(u32, 1), sc.run(&again, &logits, &cached, 0.3, 3));
+}
+
+test "group cache reports only ready residents as cached" {
+    const t = std.testing;
+    var cache = try GroupCache.init(t.allocator, 3, 8);
+    defer cache.deinit();
+    var first = try cache.resolve(t.allocator, &.{ 0, 1, 2 });
+    defer first.deinit(t.allocator);
+    var mask: [8]bool = undefined;
+    cache.cachedMask(&mask);
+    try t.expectEqualSlices(bool, &@as([8]bool, @splat(false)), &mask);
+    cache.markReady(first.bindings[0].slot.?);
+    cache.markReady(first.bindings[1].slot.?);
+    cache.cachedMask(&mask);
+    try t.expect(mask[0] and mask[1] and !mask[2] and !mask[3]);
+}
+
+test "spec map follows the ready cache slots and reports changes" {
+    const t = std.testing;
+    const expert_to_slot = [_]i32{ 2, -1, 0, 1 };
+    const ready = [_]bool{ true, false, true };
+    var out = [_]i32{ -2, -2, -2, -2 };
+    try t.expect(refreshSpecMap(&expert_to_slot, &ready, &out));
+    try t.expectEqualSlices(i32, &.{ 2, -1, 0, -1 }, &out);
+    try t.expect(!refreshSpecMap(&expert_to_slot, &ready, &out));
+}
+
+test "spec result is kept only when every id resolved to its gathered slot" {
+    const t = std.testing;
+    const map = [_]i32{ 3, -1, 0, 7 };
+    try t.expect(specMatches(&map, &.{ 0, 2, 3 }, &.{ 3, 0, 7 }, false));
+    try t.expect(!specMatches(&map, &.{ 0, 2, 3 }, &.{ 3, 0, 7 }, true));
+    try t.expect(!specMatches(&map, &.{ 0, 1 }, &.{ 3, 5 }, false));
+    try t.expect(!specMatches(&map, &.{ 0, 2 }, &.{ 3, 1 }, false));
+    try t.expect(!specMatches(&map, &.{9}, &.{0}, false));
+}
+
+test "a failed spec map refresh leaves no GPU map until a rebuild matches the cache" {
+    const t = std.testing;
+    var layer = LayerState{ .cache = try GroupCache.init(t.allocator, 2, 4) };
+    defer {
+        if (layer.spec_slots.ctx != null) _ = mlx.mlx_array_free(layer.spec_slots);
+        t.allocator.free(layer.spec_host);
+        layer.cache.deinit();
+    }
+    var first = try layer.cache.resolve(t.allocator, &.{ 0, 1 });
+    defer first.deinit(t.allocator);
+    markResolvedReady(&layer.cache, &first);
+    try layer.refreshSpec(t.allocator);
+    var second = try layer.cache.resolve(t.allocator, &.{ 0, 2 });
+    defer second.deinit(t.allocator);
+    markResolvedReady(&layer.cache, &second);
+    spec_alloc_fail_for_test = true;
+    try t.expectError(error.ExpertSpecMapAlloc, layer.refreshSpec(t.allocator));
+    try t.expect(layer.spec_slots.ctx == null);
+    try layer.refreshSpec(t.allocator);
+    const gpu = mlx.mlx_array_data_int32(layer.spec_slots).?;
+    for (layer.spec_host, 0..) |host, e| try t.expectEqual(@max(host, 0), gpu[e]);
+    try t.expectEqual(layer.cache.expert_to_slot[2], layer.spec_host[2]);
 }

@@ -10,7 +10,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
 ## Surfaces
 
 - **OpenAI chat/completions + Responses**: usage ALWAYS carries `prompt_tokens_details.cached_tokens`; thinking
-  opt-ins = `reasoning_effort` OR `enable_thinking` (`reasoning_budget_tokens` outranks); `n>1` 400s.
+  opt-ins = `reasoning_effort` OR `enable_thinking` (top-level, else vLLM's `chat_template_kwargs.enable_thinking`;
+  `reasoning_budget_tokens` outranks); a request naming neither takes the arch default (`defaultEnableThinking`);
+  on Responses a `reasoning` object decides alone, and without one the same rule applies; `n>1` 400s.
 - **Effort vocabulary** `off low medium high xhigh max` (`none` = off; `minimal` keeps the legacy 1024 budget):
   each served arch accepts a subset (`model.effortArms`), listed as `reasoning_efforts` on its `/v1/models` row; any
   other word 400s on chat, Responses and Anthropic with the accepted list, never rounded. qwen4_exp: off, low (2048),
@@ -34,6 +36,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
 - `/v1/models` `meta.quantization` reports EXL3’s configured expert rate and dense width (e.g. `EXL3 3bpw experts, 8-bit dense`) for loaded and unloaded packs; affine labels remain `{bits}-bit`, and `/props` numeric quantization fields retain their dense-trunk meaning.
 - Endpoint EXISTENCE never depends on model state and the 404 is answered BEFORE the model resolves (`ROUTE_PATHS`);
   a status route never reaches `ensureLoaded` (`handlePropsNoModel`). Removed upstream routes answer named 404s.
+- **Only an unknown NAME falls back to the default model** (SDK names like `gpt-4`); a PATH (`/…`, `~/…`, never
+  `org/repo`) names its own entry as `/v1/load-model` resolves it (`routeRequestModel` → `registry.peekPath`), and an
+  unregistered path is a 404 `model_not_found` (Anthropic `not_found_error`), never another model's answer.
 - A content array's text parts JOIN in order (`joinedTextParts`); its media parts render at the offset they sat at.
 - **Media is read from EVERY message** on all three surfaces: chat `image_url`/`video_url` parts in any role
   (`tool` included), Anthropic `image` blocks beside the text or inside a `tool_result`, Responses `input_image` in
@@ -47,15 +52,32 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
 - **A stream and a non-stream answer are the SAME BYTES**; leading whitespace is the one thing a stream may withhold
   (`streamContentLead`). A spent reasoning budget WITHHOLDS the rest of the thought; a non-stream tool-call reply
   carries the pre-markup text (`visibleToolPreamble`); a non-stream disconnect reports `client_disconnect`, never
-  `length`; a stop sequence cuts at its INDEX (`stopSequenceCut`); request ints clamp (`parseRequestSeed`,
+  `length`, and is noticed after every decoded token as well as during prefill, so a client's timed-out retry never
+  leaves a ghost decoding to `max_tokens`; a stop sequence cuts at its INDEX (`stopSequenceCut`); request ints clamp (`parseRequestSeed`,
   `clampJsonI32`).
 - **`stream_options.include_usage` chunk ships `"choices": []`** (`sendSSEUsageChunk`); the ending appears on exactly
   ONE chunk; a client cannot time our stream — use the final chunk's server `timings`.
 - Liveness is a property of the SOCKET: `beatStreamKeepalive` at the bottom of every streaming loop, emit on 5 s
-  byte-silence. `--timeout` is a STALL timeout (`StallClock`).
+  byte-silence. SSE comments keep the transport alive but do not count as model progress for every client.
+  `sushi launch omp` sets the Sushi provider's `compat.streamIdleTimeoutMs: 0` so buffered calls can finish;
+  explicit omp timeout settings, environment overrides and per-call options still take precedence (verified with
+  omp 18.3.0). Non-loopback `--url` targets also have a separate first-event deadline: omp's
+  `providers.streamFirstEventTimeoutSeconds` controls it, with zero allowing unlimited initial buffering.
+  `--timeout` remains a token-progress STALL timeout (`StallClock`).
 - **NO string built from model bytes is guaranteed UTF-8**: sanitizing lives INSIDE the escaper (`chat.utf8Next`
   under every `jsonEscape`/`appendJsonString`); logprobs `bytes` keeps the exact bytes. Hand-written error text is
   escaped at the SINK.
+
+### Closing a streamed response
+
+`Conn.close` half-closes the write side of a close-delimited response, then holds the socket until the peer
+hangs up, server shutdown starts, or five minutes pass. This prevents macOS's orphaned FIN_WAIT_2 timeout from
+resetting a client that is still reading after the final SSE event. The request has already released its model
+slot; only the connection thread waits. Responses with `Content-Length` close immediately.
+
+Ported from [mlx-serve #673](https://github.com/ddalcu/mlx-serve/pull/673). Socket-pair tests cover peer closure,
+length-framed responses and shutdown; `tests/test_responses_streaming.sh` also waits past the TCP FIN timeout
+before reading a completed stream and requires clean EOF.
 
 ## Seeds, logprobs, sampling
 
@@ -70,12 +92,64 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   constantly; `ranksDescending` ties by lowest id); the nucleus is the mass STRICTLY above each rank, cumsum in f32;
   `top_p` 0 is GREEDY (`applyTopP` floors at `floatMin(f32)`).
 - A sampler never draws a RESERVED special or PADDING row (`installSuppressMask`; logprobs stay RAW).
+- **`ignore_eos: true`** (vLLM's field) decodes a `/v1/completions` request past EOS to `max_tokens`
+  (`requestEosSlice`); stop sequences and the loop stops still end it, and its text skips `special: true` tokens
+  (`completionShowsToken`, vLLM's default `skip_special_tokens`). Chat refuses it with a named 400
+  (`chatIgnoreEosRejectReason`): past its end of turn the model writes another turn, and that turn's think block is
+  merged into the reasoning by the non-stream reply (`normalizeEmbeddedThinkBlocks`) but not by the live stream.
+- **A repeat/presence penalty samples on the synchronous serial path** (`samplesSync`, like logprobs): no draft
+  path (`draftsRefused`), no batched tick (`.penalty`), never the lazy pipeline, which never applied it.
+  A penalty-mask allocation failure fails the request instead of sampling without its penalty. Chat and
+  completions parse it alike (`parseRepeatPenalty`); a repeat penalty of 0 or below is off.
+- **Think penalty** (`think_penalty` request > `--think-penalty` > model-settings.json > off, 0-20; arXiv 2606.00206):
+  while the thought is open every single-token spelling of the paper's markers (bare or space-led, lower or capital)
+  loses λ; a split spelling is skipped (its first piece starts other words). The paper penalises everywhere; we stop
+  at the closer. Every sampled position, serial or verify row, is shifted by its own prefix (`thinkShifted`,
+  `thinkShiftRows`), so greedy MTP keeps serial's bytes; logprobs stay RAW.
+
+
+## Experimental logit bias
+
+`--logit-bias-file <path>` loads a JSON or CSV file at model load; the launch flag overrides the per-model
+`logit_bias_file` setting. The default is off. Each entry names exactly one `id`, exact vocabulary `token` string,
+or `word`; words expand to single-token lower/capital spellings with and without a leading space. Split spellings
+are skipped and counted in the load log.
+
+```json
+{"entries":[{"word":"Wait","delta":-1,"scope":"reasoning"},{"id":1234,"delta":2}]}
+```
+
+The equivalent CSV columns are `kind,target,delta,scope`:
+
+```csv
+kind,target,delta,scope
+word,Wait,-1,reasoning
+id,1234,2,all
+```
+
+`delta` is finite and between -100 and 100: negative penalizes, positive rewards. `scope` is `reasoning`, `answer`,
+or `all` (default). Answer scope applies outside reasoning, including before an opener; the closer ends reasoning.
+Unknown targets/scopes, out-of-vocabulary ids and malformed files fail model load with a named `LogitBias*` error.
+The load line reports the file, entry count, expanded ids and skipped spellings.
+
+`/v1/chat/completions` and `/v1/completions` accept OpenAI `logit_bias`, a map such as `{"1234":-2}`. These deltas
+apply to all positions and add to file entries and the optional think-penalty preset. Invalid ids, nonnumeric or
+out-of-range biases return 400. `think_penalty: 0` disables the preset only; file and request biases still apply.
+Overlapping entries add. Sampling uses shifted logits; returned logprobs remain raw.
+
+Scoped vectors are prepared once per request on the inference thread. Active biases use the full target vocabulary
+head, including positive rewards. Serial, MTP, PLD and prompt-lookup rows apply the same prefix-dependent shifts;
+streaming and non-streaming preserve the same generated tokens. Existing non-stream-only repetition-tail trimming
+can still shorten displayed loop-stop replies; `SUSHI_LOOP_TRIM=0` disables that presentation step for strict byte
+comparisons while retaining loop detection. The unchanged `--think-penalty` preset remains off by default.
 
 ## Reasoning budget
 
 Enforced at DECODE (`server.armThinkBound` → `SamplingParams.think_bound`, `scheduler.thinkBoundTick`): at the budget
 the early-stop line + the atomic closer commit as ONE multi-token forward (`commitForcedTokens`); the whole closed
-thought is delivered. Guard: `tests/test_reasoning_budget_stream.sh`. Effort budgets = pi's ladder
+thought is delivered. Every decode tick checks it with the loop stop (`loopGuardTick`), the plain batched tick too
+(`batchedTickRows`): skipped there, a budget under `--max-concurrent` overran by up to ~2.5k tokens while its slot
+batched plain. Guard: `tests/test_reasoning_budget_stream.sh`. Effort budgets = pi's ladder
 (`model.effortArms` for served arches, `responses.effortBudget` for the rest).
 Every surface arms it with one precedence: explicit budget (`reasoning_budget_tokens`, Anthropic `budget_tokens`) > the
 effort word's budget > `--reasoning-budget`. `/v1/responses` parsed the word and dropped the budget.
@@ -153,6 +227,8 @@ effort word's budget > `--reasoning-budget`. `/v1/responses` parsed the word and
 
 - `src/launch.zig` (claude/pi/omp/opencode/codex/hermes/aider): reads `/v1/models`, writes agent configs into
   `~/.sushi/<agent>/`. Launcher env: `ANTHROPIC_BASE_URL` + dummy keys + `ANTHROPIC_DEFAULT_*_MODEL=sushi`.
+- Claude Code's stream watchdogs and 10-min request timeout are raised and its non-stream fallback is off: a long
+  prefill plus a long think tripped them, and each fallback re-sent the whole prompt, then timed out and retried.
 - Agent budgets (`launch.budgetForContext` + `compactionReserve`): output share ctx/2, compaction reserve ctx/4
   capped at 20000, carried into pi's `settings.json` and opencode's `compaction` + `limit.output`. A launch below the
   agent's context floor WARNS (claude 64k, opencode 32k, others 16k).
@@ -163,9 +239,26 @@ effort word's budget > `--reasoning-budget`. `/v1/responses` parsed the word and
   switches thinking requests to `reasoning_effort`, and a per-model `thinking` block remaps each level with the same
   rule; `requiresEffort: false` stops omp clamping off to the lowest effort.
 
+## Web UI research tools
+
+- The composer's **Tools on/off** button enables the same research pack as `sushi run`, off by default.
+  The preference persists in this browser. It is fixed for a turn; the button is disabled while a reply runs.
+- The browser sends definitions, assembles streamed tool calls, executes them through `POST /v1/tools`, and
+  sends results back to the model. Eight tool rounds maximum, followed by a final request without tools.
+  Results are collapsible in the transcript. Stop cancels browser requests and records cancelled results for
+  remaining calls so the conversation stays valid. An already-running server tool may finish its bounded work.
+- `POST /v1/tools` with `{ "vision": false }` lists definitions and the file root. With `name`, JSON-string
+  `arguments`, and `vision`, it executes one call and returns `text` plus optional `image` data URL.
+  Vision models get `view_image`; returned images remain in memory only.
+- This bridge requires a loopback bind and peer, the chat page's Origin, and the normal API-key policy.
+  It works from `localhost` or `127.0.0.1`, not a remote browser or wildcard bind. File tools are confined to
+  the server's working folder, with the existing hidden/secret-file and symlink checks; network tools keep
+  the REPL's public-address restrictions. No MCP configuration is added.
+- Checks: `node tests/test_webui_tools.cjs`, `tests/test_webui.sh`, and the `web tools:` unit test.
+
 ## `sushi run` research tools (client-side)
 
-- **The REPL runs the tools, the server never does** (`src/repl_tools.zig`, loop `cli.runToolTurn`): it sends `tools`,
+- **The REPL orchestrates and runs its tools locally** (`src/repl_tools.zig`, loop `cli.runToolTurn`): it sends `tools`,
   runs the returned calls, appends `tool` messages and asks again. OFF by default: `--tool on|off`, `/tool on|off`,
   bare `/tool` shows the state and list. One dim trace line per call (`search:`, `fetch:`, `read:` …).
 - Tools: `web_search` (GET html.duckduckgo.com, top 8 title/url/snippet, `uddg=` unwrapped, ads dropped),

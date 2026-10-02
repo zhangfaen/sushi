@@ -16,6 +16,7 @@ const mtp_mod = @import("mtp.zig");
 const chat_mod = @import("chat.zig");
 const server_mod = @import("server.zig");
 const scheduler_mod = @import("scheduler.zig");
+const expert_stream_mod = @import("expert_stream.zig");
 const model_settings_mod = @import("model_settings.zig");
 const vision_mod = @import("vision.zig");
 const cli_mod = @import("cli.zig");
@@ -154,6 +155,11 @@ fn printUsage(io: std.Io) void {
         \\                      keep every turn's thinking (on, the template default)
         \\                      or only the latest user turn's (off). Request
         \\                      chat_template_kwargs > this flag > model-settings.json
+        \\  --logit-bias-file <path> Experimental JSON/CSV scoped token penalties and rewards.
+        \\  --think-penalty <f> Lower the logits of ~50 overthinking markers ("Wait",
+        \\                      "But", "Alternatively", ...) by f inside the reasoning
+        \\                      span (default 0 = off). Request think_penalty > this
+        \\                      flag > model-settings.json
         \\  --no-vision         Disable vision encoder (saves memory)
         \\  --no-prevent-sleep  Allow Mac idle sleep during inference and model
         \\                      loads. Display sleep is always allowed.
@@ -178,11 +184,13 @@ fn printUsage(io: std.Io) void {
         \\                        for sampled requests, greedy requests unchanged.
         \\  --no-mtp            Disable the native MTP head. Both served models
         \\                        load it and run it by default.
-        \\  --mtp               Force the MTP head ON, also for an SSD-streamed
-        \\                        pack (off by default there) and other MoE models.
+        \\  --mtp               Force the MTP head ON. Both served models run it
+        \\                        by default; an SSD-streamed pack loads with it
+        \\                        off and refuses --mtp.
         \\  --mtp-head-kv-quant Quantize the qwen4 MTP head's own KV with
         \\                        --kv-quant (default OFF: the head keeps
-        \\                        dense bf16 KV).
+        \\                        dense bf16 KV). No effect on MiMo, whose
+        \\                        heads keep a dense sliding window.
         \\  --decode-attn-quant / --no-decode-attn-quant
         \\                      Serve decode from quantized side copies of
         \\                      DENSE (bf16/f16) attention projection weights:
@@ -246,20 +254,23 @@ fn printUsage(io: std.Io) void {
         \\                        per-request `kv_attn_mode` field overrides.
         \\                        MiMo's global layers read packed from 4096
         \\                        cached keys in every mode.
-        \\  --prefill-chunk <n> Max tokens forwarded per prefill chunk
+        \\  --prefill-chunk <n> Maximum tokens forwarded per prefill chunk
         \\                        (default: 8192). Auto-capped further per model
         \\                        so one layer's attention scores stay within
         \\                        budget; this flag is the ceiling, not a floor.
-        \\                        Lower it if a long prompt spikes memory.
+        \\                        When a request does not fit at <n>, it runs
+        \\                        at the widest narrower width that fits (down
+        \\                        to 512) instead of being refused.
         \\  --prefill-decode-share <s>
         \\                      Target decode wall-time share during another
         \\                        request's prefill (0..0.9); narrows chunks too.
         \\                        Default 0; env SUSHI_PREFILL_DECODE_SHARE.
         \\  --prefix-cache-entries <n>
         \\                      Hot prefix cache LRU capacity in entries
-        \\                        (default: 32). 0 disables the cache — which also
-        \\                        turns off SSM checkpoint capture, since
-        \\                        checkpoints exist only to feed it.
+        \\                        (default: 32). 0 disables all prefix reuse.
+        \\  --no-prefix-cache-ram
+        \\                      Disable idle RAM retention; an enabled SSD tier
+        \\                        still persists and restores reusable prefixes.
         \\  --prefix-cache-mem <n>{{KB,MB,GB}}
         \\                      Hot prefix cache KV-bytes budget (default: one
         \\                        session at the working context where memory
@@ -294,15 +305,24 @@ fn printUsage(io: std.Io) void {
         \\  --wired-margin-gib <n>
         \\                      How far under iogpu.wired_limit_mb a plan may
         \\                        reach (default: 8, integers 2..32).
+        \\  --expert-pick-tolerance <n>
+        \\                      LOSSY, streamed packs only (default: 0 = off,
+        \\                        exact routing). A routed expert missing from the
+        \\                        cache is replaced by the best cached expert the
+        \\                        router did not pick, when that expert's probability
+        \\                        is at least (1 - n) x the missed one's. 0..0.6;
+        \\                        0.3 is a mild setting. A sigmoid router (MiMo)
+        \\                        compares sigmoid probabilities.
         \\  --tokenize-cache-entries <n>
         \\                      Per-model LRU cache of chat-template render +
         \\                        tokenize results (default: 4). Skips re-
         \\                        rendering identical messages on warm reuse.
         \\                        0 disables.
         \\  --expert-cache-gb <n>
-        \\                      Enable bf16 qwen4_exp expert streaming with a
-        \\                        decimal-GB cache (default operating point: 60).
-        \\  --ssd-budget-gb <n> Enable bf16 qwen4_exp expert streaming with a
+        \\                      Stream qwen4_exp routed experts (bf16 checkpoint
+        \\                        or Sushi pack) with a decimal-GB cache.
+        \\  --ssd-budget-gb <n> Stream qwen4_exp routed experts (bf16 checkpoint
+        \\                        or Sushi pack) with a
         \\                        TOTAL resident target of <n> GiB; the expert
         \\                        cache is what is left after the trunk, the
         \\                        prefill union and the fill buffers.
@@ -325,6 +345,9 @@ fn printUsage(io: std.Io) void {
         \\  --idle-evict-secs <n>
         \\                      Evict .ready entries with refcount==0 if
         \\                        idle for this many seconds. Default: off.
+        \\  --gpu-warm-secs <n> Keep the GPU awake for this many seconds after
+        \\                        the last request, so the next one starts
+        \\                        without a wake-up delay (default: 60, 0 = off).
         \\  --metrics           Enable Prometheus metrics at GET /metrics (opt-in;
         \\                        zero cost when off). Also GET /metrics.json.
         \\  --no-tool-autocorrect
@@ -784,6 +807,8 @@ pub fn main(init: std.process.Init) !void {
             } else |_| {}
         } else if (std.mem.eql(u8, args[i], "--prefill-trace")) {
             generate_mod.prefill_trace_force = true;
+        } else if (std.mem.eql(u8, args[i], "--no-prefix-cache-ram")) {
+            server_mod.prefix_cache_ram_enabled = false;
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-entries") and i + 1 < args.len) {
             i += 1;
             server_mod.prefix_cache_capacity = std.fmt.parseInt(u32, args[i], 10) catch 1;
@@ -808,6 +833,17 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--prefix-cache-disk: expected '<n>{{MB,GB,KB}}' or '0'/'off'; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
+        } else if (std.mem.eql(u8, args[i], "--logit-bias-file") and i + 1 < args.len) {
+            i += 1;
+            model_settings_mod.logit_bias_file_flag = args[i];
+        } else if (std.mem.eql(u8, args[i], "--think-penalty") and i + 1 < args.len) {
+            i += 1;
+            const lambda = std.fmt.parseFloat(f32, args[i]) catch -1;
+            if (!(lambda >= 0 and lambda <= model_settings_mod.think_penalty_max)) {
+                log.err("--think-penalty: expected a number from 0 to {d}; got '{s}'\n", .{ model_settings_mod.think_penalty_max, args[i] });
+                std.process.exit(1);
+            }
+            model_settings_mod.think_penalty_flag = lambda;
         } else if (std.mem.eql(u8, args[i], "--preserve-thinking") and i + 1 < args.len) {
             i += 1;
             model_settings_mod.preserve_thinking_flag = server_mod.parseOnOff(args[i]) orelse {
@@ -834,6 +870,12 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             server_mod.wired_limit_margin_bytes = server_mod.parseWiredMarginGib(args[i]) catch {
                 log.err("--wired-margin-gib: expected an integer 2..32, got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, args[i], "--expert-pick-tolerance") and i + 1 < args.len) {
+            i += 1;
+            expert_stream_mod.pick_tolerance = expert_stream_mod.parsePickTolerance(args[i]) catch {
+                log.err("--expert-pick-tolerance: expected a number from 0 to 0.6, got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
         } else if (std.mem.eql(u8, args[i], "--prefill-decode-share") and i + 1 < args.len) {
@@ -879,6 +921,12 @@ pub fn main(init: std.process.Init) !void {
                 };
                 max_resident_mem_explicit = true;
             }
+        } else if (std.mem.eql(u8, args[i], "--gpu-warm-secs") and i + 1 < args.len) {
+            i += 1;
+            scheduler_mod.gpu_warm_secs = std.fmt.parseInt(u32, args[i], 10) catch {
+                log.err("--gpu-warm-secs: expected a whole number of seconds, got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
         } else if (std.mem.eql(u8, args[i], "--idle-evict-secs") and i + 1 < args.len) {
             // Idle eviction window. When set, `server.idleEvictLoop` unloads
             // .ready entries (refcount==0) whose last_used_ms is older than
@@ -1359,6 +1407,7 @@ pub fn main(init: std.process.Init) !void {
             idle_evict_secs,
         );
         defer registry.deinit();
+        registry.mem_cap_binds_alone = max_resident_mem_explicit;
 
         // Register the loaded model. Use the pre-registered discovery entry
         // when available (so id/path/bytes_on_disk are consistent across
@@ -1409,13 +1458,14 @@ pub fn main(init: std.process.Init) !void {
             .kv_quant_config = kv_quant_config,
             .kv_quant_explicit = kv_quant_explicit,
             .prefix_cache_capacity = server_mod.prefix_cache_capacity,
+            .prefix_cache_ram_enabled = server_mod.prefix_cache_ram_enabled,
             .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
             .prefix_cache_mem_resolver = server_mod.prefixCacheMemForLoad,
             .prefix_cache_disk_bytes = server_mod.prefix_cache_disk_bytes,
             .expert_cache_bytes = expert_cache_bytes,
             .ssd_budget_bytes = ssd_budget_bytes,
             .expert_cache_fit_resolver = server_mod.expertCacheFitForLoad,
-            .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity),
+            .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity, server_mod.prefix_cache_ram_enabled, server_mod.prefix_cache_disk_bytes),
             .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
             .tokenize_cache_entries = server_mod.tokenize_cache_entries,
             .metrics = server_mod.g_metrics,
@@ -1456,6 +1506,8 @@ pub fn main(init: std.process.Init) !void {
 
         // Reserved-token suppression, same derivation as the serve path.
         generate_mod.installSuppressMask(&xfm, tok, chat_config.chat_template, config.eosTokenSlice());
+        generate_mod.installThinkMarkers(&xfm, tok);
+        try generate_mod.installLogitBias(io, &xfm, tok);
 
         // Honor --kv-quant in offline mode too. The serve path threads this
         // through Slot caches via the scheduler; here we swap the
@@ -1648,6 +1700,7 @@ fn runHeadlessServe(
 
     const registry = try model_registry_mod.ModelRegistry.init(allocator, io, discovery, max_resident_models, effective_max_resident_mem, idle_evict_secs);
     defer registry.deinit();
+    registry.mem_cap_binds_alone = max_resident_mem_explicit;
 
     // Carrier entry for LoadParams (required field), never loaded here
     // (`no_initial_load`). Prefer a discovered stub (so it's listed in
@@ -1710,13 +1763,14 @@ fn runHeadlessServe(
         // was silently dead for the entire headless serving mode (the default
         // `serve` path). Mirrors the LoadParams built in `main()`.
         .prefix_cache_capacity = server_mod.prefix_cache_capacity,
+        .prefix_cache_ram_enabled = server_mod.prefix_cache_ram_enabled,
         .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
         .prefix_cache_mem_resolver = server_mod.prefixCacheMemForLoad,
         .prefix_cache_disk_bytes = server_mod.prefix_cache_disk_bytes,
         .expert_cache_bytes = expert_cache_bytes,
         .ssd_budget_bytes = ssd_budget_bytes,
         .expert_cache_fit_resolver = server_mod.expertCacheFitForLoad,
-        .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity),
+        .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity, server_mod.prefix_cache_ram_enabled, server_mod.prefix_cache_disk_bytes),
         .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
         .tokenize_cache_entries = server_mod.tokenize_cache_entries,
         .ane_prefill = ane_prefill,

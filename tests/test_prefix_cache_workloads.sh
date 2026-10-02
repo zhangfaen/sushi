@@ -39,8 +39,10 @@ if [ ! -x "$BINARY" ]; then
     exit 1
 fi
 
-pkill -f "sushi.*--port $PORT" 2>/dev/null || true
-sleep 1
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
+    echo "port $PORT is already in use; stop that server or pass another port" >&2
+    exit 1
+fi
 
 LOGFILE=$(mktemp)
 echo "  starting server (--prefix-cache-entries 4)..."

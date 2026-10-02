@@ -41,6 +41,7 @@ test {
     _ = @import("ws.zig");
     _ = @import("pld_index.zig");
     _ = @import("mtp_lookup.zig");
+    _ = @import("think_penalty.zig");
     _ = @import("kv_quant.zig");
     _ = @import("model_settings.zig");
     _ = @import("drafter.zig");

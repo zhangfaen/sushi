@@ -1,5 +1,5 @@
-//! Read-only research tools the `sushi run` REPL runs CLIENT-side: web search,
-//! page fetch, confined file reads and image viewing. The server never sees them.
+//! Read-only research tools shared by `sushi run` and the local web UI bridge:
+//! web search, page fetch, confined file reads and image viewing.
 
 const std = @import("std");
 const regex = @import("regex.zig");
